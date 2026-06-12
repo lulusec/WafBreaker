@@ -57,21 +57,6 @@ The scan runs in a background thread — Burp stays responsive.
 
 ---
 
-## Editing & rebuilding
 
-```
-# Edit source
-notepad waf_source_backup.py
-
-# Syntax check before building
-python -c "import ast; ast.parse(open('waf_source_backup.py').read()); print('OK')"
-
-# Rebuild clean output
-python build.py
-
-# Reload in Burp: Extensions tab → select WafBreaker → Reload
-```
-
----
 
 *WafBreaker — built session by session.*
