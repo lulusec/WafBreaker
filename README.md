@@ -57,6 +57,3 @@ The scan runs in a background thread — Burp stays responsive.
 
 ---
 
-
-
-*WafBreaker — built session by session.*
